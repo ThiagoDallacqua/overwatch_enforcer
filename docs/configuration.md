@@ -38,6 +38,7 @@ $ oe status              -> no sessions found under ~/.claude/projects
 $ oe rereads --all       -> no file reads found for that selector
 $ oe savings --all       -> savings  0 transcripts / measured spend in scope  $0.00
 $ oe shrink --all        -> no file reads found for that selector
+$ oe brief "anything"     -> nothing retrieved for this prompt
 $ oe audit --all         -> clean: 0 artifact(s), 0 findings
 $ oe find --stats        -> "files": 0, "db_bytes": 0
 $ oe account whoami      -> unknown   source: unknown

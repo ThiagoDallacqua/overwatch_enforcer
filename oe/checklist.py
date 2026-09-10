@@ -45,7 +45,7 @@ WARN = "warn"
 # half-copied checkout FAILS instead of silently installing fewer hooks.
 MODULES: Tuple[str, ...] = (
     "paths", "pricing", "ledger", "report", "statusline", "watcher", "dashboard",
-    "redact", "accounts", "store", "retrieval", "shrink", "autostart",
+    "redact", "accounts", "store", "retrieval", "shrink", "brief", "autostart",
     "checklist",
 )
 

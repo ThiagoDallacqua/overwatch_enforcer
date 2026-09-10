@@ -78,8 +78,8 @@ Its output is deliberately NOT redacted: read it before pasting it anywhere.
 **Measurement — zero configuration.** Nothing is installed and nothing is registered.
 Everything is derived from `~/.claude/projects/**/*.jsonl`, which Claude Code writes whether
 or not this tool exists. `oe status`, `oe watch`, `oe sessions`, `oe report`, `oe rereads`,
-`oe shrink`, `oe savings`, `oe audit` and the retrieval commands all work on a fresh clone
-with no setup.
+`oe shrink`, `oe brief`, `oe savings`, `oe audit` and the retrieval commands all work on a
+fresh clone with no setup.
 
 **Hooks and the status line — opt-in, registered by `install.py`.** Three hook entries:
 

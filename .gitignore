@@ -72,6 +72,7 @@ docs/*
 oe/*
 !oe/__init__.py
 !oe/accounts.py
+!oe/brief.py
 !oe/autostart.py
 !oe/checklist.py
 !oe/corpus.py

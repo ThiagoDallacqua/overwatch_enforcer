@@ -3659,6 +3659,70 @@ _REASON_LABEL = {
 
 
 
+
+def cmd_brief(args) -> int:
+    """What a subagent spawned on this prompt would be handed, and what it costs."""
+    brief_mod = _lazy("brief")
+    if brief_mod is None:
+        print("oe brief needs oe/brief.py, which this install does not have.",
+              file=sys.stderr)
+        return 2
+    text = args.prompt
+    if getattr(args, "file", None):
+        try:
+            text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"cannot read {args.file}: {exc}", file=sys.stderr)
+            return 1
+    if not text or not text.strip():
+        print("nothing to brief on: pass a prompt, or --file", file=sys.stderr)
+        return 1
+
+    built = brief_mod.build(text, budget_tokens=int(args.budget))
+    if getattr(args, "json", False):
+        payload = {
+            "tokens": built["tokens"],
+            "budget_tokens": built["budget_tokens"],
+            "considered": built["considered"],
+            "skipped_over_budget": built["skipped_over_budget"],
+            # The rendered outline bodies are this machine's source. They are
+            # the POINT of the command at a terminal and have no business in a
+            # pipe, so --json carries the shape and the arithmetic only.
+            "files": [{"target": redact_mod.shape_of("Read", row["path"]),
+                       "tokens": row["tokens"]} for row in built["files"]],
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    width, _h = term_size()
+    width = min(width, 100)
+    print()
+    print(rule(width, " brief "))
+    if not built["files"]:
+        print("  " + c("nothing retrieved for this prompt: no brief would be injected.", DIM))
+        print("  " + c(f"{built['considered']} candidate(s) considered.", DIM))
+        print()
+        return 0
+    for row in built["files"]:
+        print(f"  {humanize_tokens(row['tokens']):>8}  "
+              + clip_left(row["path"], max(24, width - 14)))
+    print("  " + "-" * (width - 4))
+    print(f"  {humanize_tokens(built['tokens']):>8}  total, budget "
+          f"{humanize_tokens(built['budget_tokens'])}"
+          + (c(f"   {built['skipped_over_budget']} did not fit", DIM)
+             if built["skipped_over_budget"] else ""))
+    print()
+    for line in _wrap("This text would be appended to the spawn prompt and is resident for "
+                      "that agent's whole life, re-billed on every request it makes. "
+                      "Retrieval is often wrong: measured on this machine it names a "
+                      "minority of the files an agent goes on to read.", width - 4):
+        print("  " + c(line, DIM))
+    print()
+    if getattr(args, "show", False):
+        print(brief_mod.render(built))
+    return 0
+
+
 def cmd_shrink(args) -> int:
     """What each read cost, against what this machine's index could have printed."""
     shrink_mod = _lazy("shrink")
@@ -4616,6 +4680,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "the corpus-calibrated rate")
     rereads.add_argument("--json", action="store_true")
     rereads.set_defaults(func=cmd_rereads)
+
+    brief = sub.add_parser(
+        "brief", help="what a subagent spawned on this prompt would be handed")
+    brief.add_argument("prompt", nargs="?", default="", help="the task prompt")
+    brief.add_argument("--file", help="read the prompt from a file instead")
+    brief.add_argument("--budget", type=int, default=1500,
+                       help="token ceiling on the brief (default 1500)")
+    brief.add_argument("--show", action="store_true",
+                       help="print the brief itself, not just what it would cost")
+    brief.add_argument("--json", action="store_true")
+    brief.set_defaults(func=cmd_brief)
 
     shrink = sub.add_parser(
         "shrink", help="what each read cost against what the index could have printed")
