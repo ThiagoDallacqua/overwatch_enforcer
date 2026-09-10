@@ -32,6 +32,34 @@ $ oe status 3f5c1a90
 `no timing` in the tool table is not a fault: wall time per tool call exists nowhere in the
 transcript, so no session has it. See [Known limits](operations.md#known-limits).
 
+#### The cache residency block
+
+The `cost by token kind` table says how many dollars went on cache reads. It cannot say
+whether that was one enormous request or a thousand ordinary ones, and those call for
+opposite responses. `cache residency` answers the second question, because every request
+re-sends the whole prefix and a session's bill is therefore prefix size times request count.
+
+* **per request** — what one request pays to re-send your window before it does any work.
+* **per message** — the median turn. Turns that only spent their budget on agents are left
+  out, and the median rather than the mean, so one large fan-out does not set the figure for
+  every ordinary turn. Shown once there are at least three turns to take a middle of.
+* **next request** — the marginal figure: what the window resident right now would cost to
+  re-send. Priced at this session's own realised rate, so it already carries whatever tier,
+  region and model the session actually used, rather than a rate looked up from a table.
+* **per window fill** — appears once the window has emptied at least once. Filling a context
+  window is the unit of work this tool can price; this is the average cost of one.
+* **agent windows** — appears when agent context is at least a twentieth of the cache-read
+  bill. Subagent and workflow windows are re-sent too, and they are not your window.
+
+Three cautions, all of which the block states in its own words or inherits from the total
+above it. Every figure is derived from the session in front of it and none is a target or a
+threshold. All are floors: a subagent-heavy session reads under the billed figure, because a
+sidechain transcript never writes back its final usage record. And `next request` is a floor
+in a second way — a prefix that has fallen out of cache is re-*written* rather than read,
+which costs more.
+
+The same per-turn figure is the `Re-read` column of section 07 of the HTML report.
+
 ### `oe watch`
 
 The live view of every open session, redrawing on an interval, and it keeps the per-session

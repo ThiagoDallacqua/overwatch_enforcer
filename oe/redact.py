@@ -1124,7 +1124,8 @@ _WASTE_FIELDS: Tuple[str, ...] = (
 
 _GROWTH_FIELDS: Tuple[str, ...] = (
     "tokens_per_turn", "per_call_tokens", "turns_until_full", "current_tokens",
-    "max_tokens", "headroom_tokens", "resets", "samples", "turns_sampled",
+    "max_tokens", "headroom_tokens", "resets", "major_resets", "samples",
+    "turns_sampled",
 )
 
 _CACHE_FIELDS: Tuple[str, ...] = (
@@ -1203,6 +1204,11 @@ _TURN_FIELDS: Tuple[str, ...] = (
     "index", "first_ts", "calls", "tokens", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "cost", "tools",
     "subagent_calls", "duration_s", "context_end_tokens",
+    # Per-kind dollars, spelled out rather than imported, to match
+    # _BY_MODEL_FIELDS and _BY_ORIGIN_FIELDS. All floats: no identifier shape
+    # can hide in them. prompt_preview stays out, as above.
+    "input_usd", "output_usd", "cache_write_5m_usd", "cache_write_1h_usd",
+    "cache_read_usd", "web_search_usd", "main_cache_read_usd",
 )
 
 _AGENT_FIELDS: Tuple[str, ...] = (

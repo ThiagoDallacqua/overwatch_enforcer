@@ -635,6 +635,92 @@ def _account_rollup_lines(rows: List[Dict[str, Any]], width: int) -> List[str]:
     return lines
 
 
+
+def _residency_block(data: Dict[str, Any], totals: Dict[str, Any], width: int) -> None:
+    """What the window costs to KEEP, as opposed to what it cost to fill.
+
+    Every request re-sends the whole prefix, so a session's bill is
+    prefix_size x requests -- the one term the console never showed. The table
+    above says how many dollars went on cache reads; it cannot say whether that
+    was one enormous request or a thousand ordinary ones, and those call for
+    opposite responses.
+
+    Deliberately NOT here: the hit ratio and the cache-read share of spend.
+    Both already print, further down, as insights. A second copy of a number is
+    not a second piece of information.
+
+    Every figure is derived from the session in front of it. Nothing in this
+    block is a threshold, a target, or a figure measured somewhere else.
+    """
+    if not totals.get("cache_read_tokens"):
+        return
+    origins = data.get("by_origin") or {}
+    # by_origin keys non-main rows as "origin:agent_type", so there is no
+    # "subagent" row to read; "main" is the only fixed name. Agent spend is
+    # therefore the REMAINDER, which also folds in the workflow origin -- hence
+    # "agent windows" below, never "subagents".
+    main = origins.get("main") or {}
+    main_read_usd = float(main.get("cache_read_usd") or 0.0)
+    main_read_tokens = int(main.get("cache_read_tokens") or 0)
+    main_calls = int(main.get("calls") or 0)
+    growth = data.get("context_growth") or {}
+    window = data.get("context_window") or {}
+    lines = []
+
+    if main_calls and main_read_usd > 0:
+        lines.append(("per request",
+                      money(main_read_usd / main_calls, places=4, estimate=True),
+                      f"{main_calls:,} requests re-sent your window"))
+
+    # Median, not mean: one fan-out turn of several hundred requests would
+    # otherwise set the figure for every ordinary turn. Same reasoning, and the
+    # same statistic, as tokens_per_turn in context_growth().
+    turn_costs = sorted(float(row.get("main_cache_read_usd") or 0.0)
+                        for row in (data.get("by_turn") or [])
+                        if row.get("index", -1) >= 0
+                        and (row.get("calls") or 0) - (row.get("subagent_calls") or 0) > 0)
+    # Under three turns there is no middle to take, and "median over 1" is a
+    # sentence that describes nothing.
+    if len(turn_costs) >= 3:
+        middle = len(turn_costs) // 2
+        median = (turn_costs[middle] if len(turn_costs) % 2
+                  else (turn_costs[middle - 1] + turn_costs[middle]) / 2.0)
+        if median > 0:
+            lines.append(("per message", money(median, places=4, estimate=True),
+                          f"median of your {len(turn_costs)} turns"))
+
+    # The marginal figure: what the NEXT request pays before it does any work.
+    # Priced at this session's own realised main-loop rate rather than from the
+    # pricing table, so it already carries the geo premium, a fast-mode tier
+    # override and any mid-session model switch. It is a floor: if the prefix
+    # has fallen out of cache it is re-WRITTEN, which costs more than a read.
+    resident = int(window.get("used_tokens") or 0)
+    if resident and main_read_tokens:
+        rate = main_read_usd / main_read_tokens
+        lines.append(("next request",
+                      money(resident * rate, places=4, estimate=True),
+                      f"{humanize_tokens(resident)} resident right now"))
+
+    fills = int(growth.get("major_resets") or 0)
+    if fills and main_read_usd > 0:
+        lines.append(("per window fill", money(main_read_usd / (fills + 1), estimate=True),
+                      f"average of {fills + 1} fills; it emptied {fills}x"))
+
+    total_read_usd = float(totals.get("cache_read_usd") or 0.0)
+    agent_usd = total_read_usd - main_read_usd
+    if total_read_usd > 0 and agent_usd / total_read_usd >= 0.05:
+        lines.append(("agent windows", money(agent_usd, estimate=True),
+                      f"{100.0 * agent_usd / total_read_usd:.0f}% of cache reads "
+                      f"were agent context, not yours"))
+
+    if not lines:
+        return
+    print(rule(width, "cache residency"))
+    for label, amount, note in lines:
+        print(f"  {label:<15}{amount:>10}  " + c(clip(note, max(10, width - 30)), DIM))
+    print()
+
+
 def cmd_status(args) -> int:
     if getattr(args, "all_accounts", False):
         width, _ = term_size()
@@ -782,6 +868,8 @@ def cmd_status(args) -> int:
         print("  " + c(f"of which thinking: {humanize_tokens(totals['thinking_tokens'])} "
                        f"({share:.0f}% of output)", DIM))
     print()
+
+    _residency_block(data, totals, width)
 
     by_model = data["by_model"]
     if by_model:

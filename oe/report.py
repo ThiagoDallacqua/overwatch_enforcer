@@ -1945,6 +1945,7 @@ def render_html(ledger_dict: Dict[str, Any]) -> str:
         _cell(_e(_tok(row.get("context_end_tokens"))), row.get("context_end_tokens")),
         _num(row.get("tools")),
         _cell(_e(_dur(row.get("duration_s"))), row.get("duration_s")),
+        _cell(_e(_usd(row.get("main_cache_read_usd"))), row.get("main_cache_read_usd")),
         f"<b>{_e(_usd(row.get('cost')))}</b>",
     ] for row in sorted(turn_rows, key=lambda r: _i(r.get("index")))]
     turn_footer = ["<b>Total</b>", "", "",
@@ -1953,6 +1954,8 @@ def render_html(ledger_dict: Dict[str, Any]) -> str:
                    _cell(f"<b>{_e(_tok(sum(_i(r.get('tokens')) for r in turn_rows)))}</b>",
                          sum(_i(r.get("tokens")) for r in turn_rows)), "",
                    f"<b>{_num(sum(_i(r.get('tools')) for r in turn_rows))}</b>", "",
+                   _cell(f"<b>{_e(_usd(sum(_f(r.get('main_cache_read_usd')) for r in turn_rows)))}</b>",
+                         sum(_f(r.get("main_cache_read_usd")) for r in turn_rows)),
                    f"<b>{_e(_usd(sum(_f(r.get('cost')) for r in turn_rows)))}</b>"]
     parts.append(_section(
         "07", "Per turn",
@@ -1962,10 +1965,12 @@ def render_html(ledger_dict: Dict[str, Any]) -> str:
         '<div class="card"><div class="chartbox">' + turn_chart + "</div></div>"
         + _table([("Turn", False), ("Started", False), ("Turn id", False), ("Requests", True),
                   ("Agent reqs", True), ("Tokens", True), ("Context end", True),
-                  ("Tools", True), ("Wall", True), ("Cost", True)],
+                  ("Tools", True), ("Wall", True), ("Re-read", True), ("Cost", True)],
                  turn_table,
                  caption="Column headers sort. 'Context end' is the context carried by the "
-                         "last main-loop request of that turn.",
+                         "last main-loop request of that turn. 'Re-read' is what that turn "
+                         "paid to re-send context it already had, counting the main window "
+                         "only -- agent windows are in the Agent reqs column instead.",
                  footer=turn_footer)))
 
     # -- 08 tools -----------------------------------------------------------
