@@ -20,12 +20,22 @@
 # TREES). Those two lists disagreeing is itself a finding: `oe package`
 # compares them (see package.drift) and reports the difference.
 #
-# Ordering rule, which is why every directory appears three times: git cannot
-# re-include a file whose parent directory is excluded, so each directory is
-# re-admitted (`!oe/`) before its contents are narrowed (`oe/*` then
-# `!oe/*.py`). This is flat on purpose -- a subdirectory of oe/ or hooks/
-# would need its own trio of lines, which is the moment to ask whether it
-# should ship at all.
+# Ordering rule: git cannot re-include a file whose parent directory is
+# excluded, so each directory is re-admitted (`!oe/`), its contents are then
+# denied (`oe/*`), and every shipped file is named ONE BY ONE.
+#
+# NAMED, NOT GLOBBED, and that is the point. `!oe/*.py` admitted any .py that
+# appeared in oe/, and `!docs/*.md` admitted any .md that appeared in docs/ --
+# so a report, a dump or a scratch note written into an admitted directory by
+# some future command shipped by default. Tested: of sixteen realistic runtime
+# artefacts planted across this tree, thirteen were correctly denied and three
+# were admitted by extension alone. bin/ was already name-based; the globs were
+# the inconsistency, not this.
+#
+# The cost is one line per new file, in this list AND in oe/package.py. That
+# cost is the feature: package.drift() compares the two lists and reports any
+# disagreement, which is a check that says nothing at all when both sides are
+# globs that admit whatever arrives.
 #
 # .gitignore does nothing about a file that is ALREADY tracked, so CI asserts
 # the tracked list separately (.github/scripts/leak_gate.py).
@@ -47,7 +57,11 @@
 # which is the moment to ask whether it should ship at all.
 !docs/
 docs/*
-!docs/*.md
+!docs/commands.md
+!docs/configuration.md
+!docs/install.md
+!docs/operations.md
+!docs/privacy.md
 
 # --- the tool ---
 !install.py
@@ -56,11 +70,30 @@ docs/*
 
 !oe/
 oe/*
-!oe/*.py
+!oe/__init__.py
+!oe/accounts.py
+!oe/autostart.py
+!oe/checklist.py
+!oe/corpus.py
+!oe/dashboard.py
+!oe/ledger.py
+!oe/manifest.py
+!oe/package.py
+!oe/paths.py
+!oe/pricing.py
+!oe/redact.py
+!oe/report.py
+!oe/retrieval.py
+!oe/statusline.py
+!oe/store.py
+!oe/version.py
+!oe/watcher.py
 
 !hooks/
 hooks/*
-!hooks/*.py
+!hooks/session_end.py
+!hooks/session_start.py
+!hooks/user_prompt_submit.py
 
 # bin/oe, bin/oe-watch and bin/oe-repair are extensionless on purpose. They are
 # named one by one rather than admitted as `bin/*`, so bin/oe.bak or bin/oe.tmp
@@ -84,10 +117,13 @@ bin/*
 .github/*
 !.github/workflows/
 .github/workflows/*
-!.github/workflows/*.yml
+!.github/workflows/ci.yml
+!.github/workflows/release.yml
 !.github/scripts/
 .github/scripts/*
-!.github/scripts/*.py
+!.github/scripts/canary_leaks.py
+!.github/scripts/leak_gate.py
+!.github/scripts/sweep.py
 
 # ---------------------------------------------------------------------------
 # Belt and braces. The `*` above already excludes every one of these; they are

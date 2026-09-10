@@ -101,17 +101,72 @@ ROOT_FILES: Tuple[str, ...] = (
 #: are named. .gitignore names those three one by one, so the two lists agree.
 #: A backup can never sneak through: `bin/oe.bak-N` has a dot, and
 #: `oe/ledger.py.bak-N` has suffix `.bak-N`, so neither matches its rule.
+#: Directory -> the EXACT filenames that may leave it.
+#:
+#: NAMED, NOT GLOBBED. This mapping held extensions until a test showed what
+#: that meant: a file dropped into an admitted directory by any future command
+#: -- a report written as docs/*.md, a dump written as oe/*.py -- was admitted
+#: by BOTH this list and .gitignore, so it shipped in the bundle AND the clone,
+#: and drift() reported no disagreement because there was none. Two allowlists
+#: that both admit whatever arrives are one allowlist that admits everything.
+#:
+#: The cost is one line per new file, here and in .gitignore. That cost is what
+#: makes drift() mean something: the two lists can now actually disagree.
+#: bin/ stays extensionless-only -- its three entries are executables with no
+#: suffix, and that IS the name test for them.
 TREES: Dict[str, Optional[frozenset]] = {
-    "oe": frozenset({".py"}),
-    "hooks": frozenset({".py"}),
-    "bin": None,
+    "oe": frozenset({
+        "__init__.py",
+        "accounts.py",
+        "autostart.py",
+        "checklist.py",
+        "corpus.py",
+        "dashboard.py",
+        "ledger.py",
+        "manifest.py",
+        "package.py",
+        "paths.py",
+        "pricing.py",
+        "redact.py",
+        "report.py",
+        "retrieval.py",
+        "statusline.py",
+        "store.py",
+        "version.py",
+        "watcher.py",
+    }),
+    "hooks": frozenset({
+        "session_end.py",
+        "session_start.py",
+        "user_prompt_submit.py",
+    }),
+    # bin/ is named too. It held `None` -- meaning "any extensionless file" --
+    # and a test showed what that admitted: `bin/oe-personal`, a scratch script,
+    # entered the bundle while .gitignore correctly kept it out of the clone,
+    # because .gitignore has always named these three one by one.
+    "bin": frozenset({
+        "oe",
+        "oe-repair",
+        "oe-watch",
+    }),
     # CI definitions. They are published with everything else, so they get
-    # scanned with everything else -- a workflow file is as capable of carrying
-    # a real path or an org name as any docstring.
-    ".github": frozenset({".yml", ".yaml", ".md", ".py"}),
+    # scanned with everything else -- a workflow file is as capable of
+    # carrying a real path or an org name as any docstring.
+    ".github": frozenset({
+        "scripts/canary_leaks.py",
+        "scripts/leak_gate.py",
+        "scripts/sweep.py",
+        "workflows/ci.yml",
+        "workflows/release.yml",
+    }),
     # The README is sharded into docs/ so the landing page stays readable.
-    # They are published, so they are scanned like everything else.
-    "docs": frozenset({".md"}),
+    "docs": frozenset({
+        "commands.md",
+        "configuration.md",
+        "install.md",
+        "operations.md",
+        "privacy.md",
+    }),
 }
 
 #: Config keys whose value is about this machine and never about the tool.
@@ -843,9 +898,17 @@ def _shippable(root: Path) -> Tuple[List[Path], List[str]]:
             if not found.is_file() or "__pycache__" in found.parts:
                 continue
             if exts is None:
+                # No tree uses this any more; kept so a future directory of
+                # extensionless executables has a way in that does not silently
+                # become "anything without a dot".
                 admitted = "." not in found.name
             else:
-                admitted = found.suffix in exts
+                # Compare the path RELATIVE TO THE TREE, not the bare filename:
+                # .github/ is the one admitted directory with subdirectories, so
+                # its entries read `scripts/leak_gate.py`, and matching on the
+                # basename alone would admit a `workflows/leak_gate.py` that
+                # nobody listed.
+                admitted = found.relative_to(base).as_posix() in exts
             if admitted:
                 keep.append(found)
             else:
