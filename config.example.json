@@ -1,0 +1,30 @@
+{
+  "reports_root": "~/.claude/reports/usage",
+  "refresh_seconds": 5,
+  "idle_exit_seconds": 1800,
+  "currency": "USD",
+  "budget": {
+    "session_usd": 25.0,
+    "daily_usd": 150.0,
+    "warn_pct": 80
+  },
+  "scan": {
+    "active_within_seconds": 900,
+    "tail_bytes": 262144,
+    "head_bytes": 65536,
+    "max_sessions": 500
+  },
+  "insights": {
+    "top_turns": 8,
+    "top_tools": 12,
+    "top_subagents": 8,
+    "reread_threshold": 3,
+    "large_result_bytes": 40000
+  },
+  "report": {
+    "include_raw_calls": true,
+    "max_raw_calls": 4000
+  },
+  "accounts": {},
+  "redact_cli": "auto"
+}

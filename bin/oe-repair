@@ -1,0 +1,1860 @@
+#!/usr/bin/env python3
+"""oe-repair -- put Claude Code's settings back when a hook entry points at nothing.
+
+WHY THIS FILE IS ALONE
+----------------------
+Claude Code runs a PreToolUse hook before EVERY tool call. Delete the script a
+registered PreToolUse hook names and every Bash, Read and Write in every session
+on the machine fails the same way:
+
+    PreToolUse:Bash hook error: ... can not open file '.../hooks/pre_tool_use.py'
+
+The assistant cannot read settings.json to see the problem, cannot recreate the
+script, and cannot repair itself, because reading and writing are the things
+that broke. Getting out of that state takes a shell command typed by a human.
+
+So the recovery path has to live OUTSIDE Claude Code, and it has to survive the
+state that produced it. install.py cannot do this job -- it does
+`from oe import checklist` at module scope, so it dies with ModuleNotFoundError
+the moment oe/ is missing, and whatever removed a hook script may well have
+removed oe/ modules too. This file therefore imports NOTHING from oe/. Standard
+library only, one file, no package, no install, no PATH entry, no virtualenv:
+
+    python3 /path/to/overwatch-enforcer/bin/oe-repair
+
+If the entire oe/ directory were deleted, this still runs and still repairs the
+settings. That property is the point of the file, and it is why there is some
+duplication here (colour helpers, backup naming, the untouched-keys check) that
+looks like it belongs in a shared module. It does not. A shared module is one
+more file that can be missing at the worst moment.
+
+WHY THIS BUILD DOES NOT WRITE
+----------------------------
+v1.0.0 diagnoses and stops. The repair path is held back for one release
+because it can remove a registration that is WORKING:
+
+  * `$CLAUDE_PROJECT_DIR` and relative hook paths are resolved against
+    whichever directory you happen to be standing in, so a hook that works in
+    its own project reads as missing from anywhere else;
+  * a wrapper command -- `uv run x.py`, `env A=1 python3 x.py`, `npx tsx x.ts`
+    -- has its SUBCOMMAND read as the script name, so the real script is never
+    looked for and a working entry is reported broken;
+  * a symlinked settings.json is replaced by a regular file, severing the link
+    to wherever the real one lives.
+
+Deleting a live PreToolUse registration stops every tool call in every session
+on this machine. That is a worse outcome than the fault being repaired, and it
+is not a hypothetical -- it is why this tool exists. Until those three are
+fixed, the plan is printed and applied by hand: the changes are small and every
+line is quoted.
+
+WHAT IT WILL NOT DO
+-------------------
+It never writes a hook file, never creates a no-op hook, and never touches
+anything under hooks/. Writing a no-op into a registered PreToolUse hook is
+indistinguishable from disabling the tool-call security gate -- that is a worse
+outcome than a broken hook, and it is correctly refused elsewhere. The only
+repair here is REMOVING a registration that points at nothing.
+
+It never rewrites a file it cannot parse. A settings.json with a missing comma
+is broken, but it is also the only copy of the user's configuration, and a
+rewrite we cannot prove preserved it is how a fixable problem becomes a lost
+one. Unparseable means: report the line and column, quote the line, stop.
+
+It never edits managed/policy settings. Those belong to an administrator; they
+are found, read, and reported, and that is all.
+
+CONTRACT
+--------
+    DIAGNOSE ONLY        this build never writes. See below.
+    --yes                accepted and refused, with the reason
+    --all                also removes another tool's broken entries (never the
+                         default: silently deleting a third-party integration is
+                         worse than leaving it and saying so)
+    --root DIR           which checkout counts as "ours", when this file has
+                         been copied out of one
+    --settings FILE      check exactly one file, for rehearsing on a copy
+    --json               the same verdict on stdout, machine readable
+    exit 0               nothing broken, or everything broken was repaired
+    exit 1               something is broken and still unrepaired
+    exit 2               this tool could not run (bad arguments)
+
+WHAT IT REMOVES, AND WHAT IT ONLY REPORTS
+-----------------------------------------
+Removes: a hook or statusLine entry whose script is not there, whose
+interpreter is not there, or whose shape is not something Claude Code can run
+at all. Those are unambiguous -- the entry cannot work, and the file it names
+is gone.
+
+Reports only: a script that exists but is not executable, or has no shebang and
+no interpreter in front of it. The fix there is one chmod or one line, and
+deleting the registration would throw away a working configuration to solve it.
+Also reports only: a command with a pipe, a variable this shell cannot expand,
+or inline `-c` code -- what those run cannot be decided by looking at them, and
+a wrong guess here deletes something that worked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+# Deliberately no `from typing import ...` beyond what runs on an old 3.x, and
+# deliberately no third-party anything. The Python that runs this is whatever
+# the user's panicking shell finds first.
+
+VERSION = 1
+
+# ---------------------------------------------------------------------------
+# where things are
+# ---------------------------------------------------------------------------
+
+#: The parent of bin/ when this file is where it ships, and the directory
+#: holding it otherwise -- a copy dropped somewhere else still runs, it just
+#: cannot attribute anything to an install it is not inside. Never a literal:
+#: a hardcoded path is right on exactly one machine, and this file exists to be
+#: run on other people's.
+def _default_root():
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(here) == "bin":
+        return os.path.dirname(here)
+    return here
+
+
+def _claude_home():
+    """~/.claude, honouring Claude Code's own CLAUDE_CONFIG_DIR override."""
+    env = str(os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.abspath(os.path.expanduser("~/.claude"))
+
+
+#: Read out of the 2.1.267 binary rather than remembered: the policy directory
+#: is chosen by platform (macos -> /Library/Application Support/ClaudeCode,
+#: windows -> C:\Program Files\ClaudeCode, everything else -> /etc/claude-code)
+#: and the files inside it are managed-settings.json plus a managed-settings.d
+#: drop-in directory of *.json. WSL reads the Windows copy under /mnt/c AS WELL
+#: AS the Linux one, which is why both are listed rather than one or the other.
+def _policy_dirs():
+    dirs = []
+    if sys.platform == "darwin":
+        dirs.append("/Library/Application Support/ClaudeCode")
+    elif os.name == "nt":
+        dirs.append(r"C:\Program Files\ClaudeCode")
+    else:
+        dirs.append("/etc/claude-code")
+        if os.environ.get("WSL_DISTRO_NAME") or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
+            dirs.append("/mnt/c/Program Files/ClaudeCode")
+    return dirs
+
+
+def _project_dir(explicit):
+    """The directory Claude Code would treat as this session's project root.
+
+    Hooks get CLAUDE_PROJECT_DIR in the environment; from a bare shell -- which
+    is where somebody reading this is -- fall back to the nearest ancestor of
+    the cwd carrying a .claude/ directory, because that is where a
+    project-scoped settings file lives. ~/.claude is skipped: treating $HOME as
+    a project would read the user settings file twice under two labels.
+    """
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    env = str(os.environ.get("CLAUDE_PROJECT_DIR") or "").strip()
+    if env and os.path.isdir(env):
+        return os.path.abspath(env)
+    try:
+        here = os.path.abspath(os.getcwd())
+    except Exception:
+        return None
+    home = _claude_home()
+    while True:
+        marker = os.path.join(here, ".claude")
+        if os.path.isdir(marker) and os.path.abspath(marker) != home:
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+#
+# Everything printed here is read by somebody whose tooling just stopped
+# working, so every line either says what is wrong or says what to do about it.
+# Nothing is decorative.
+
+_QUIET = False        # --json: the only thing on stdout may be the JSON
+
+
+def _colour():
+    try:
+        return bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
+    except Exception:
+        return False
+
+
+def c(text, code):
+    return "\x1b[%sm%s\x1b[0m" % (code, text) if code and _colour() else text
+
+
+def _emit(stream, text):
+    """print() that cannot itself become the failure.
+
+    On a full disk the write we are REPORTING is not the only one that fails;
+    print() fails too, and an OSError out of fail() would replace 'write failed,
+    rolled back' with a traceback and skip the rollback. The reporting path has
+    to survive the condition it exists to report.
+    """
+    try:
+        print(text, file=stream)
+        stream.flush()
+    except Exception:
+        pass
+
+
+def say(text=""):
+    if not _QUIET:
+        _emit(sys.stdout, text)
+
+
+def warn(text):
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    _emit(sys.stderr, c("  ! " + text, "33"))
+
+
+def fail(text):
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    _emit(sys.stderr, c("  x " + text, "31;1"))
+
+
+# ---------------------------------------------------------------------------
+# reading a settings file
+# ---------------------------------------------------------------------------
+
+class SettingsFile(object):
+    """One settings file: where it is, whether it can be read, and what is in it.
+
+    `state` is the only thing the rest of the file branches on:
+        missing        not there, which for every scope but the user one is normal
+        unreadable     there, but the OS would not hand it over
+        unparseable    there, but not JSON -- NOT repairable, see repair()
+        not-an-object  valid JSON that is a list or a string, so not settings
+        ok             a dict we can walk
+    """
+
+    def __init__(self, scope, path, writable=True):
+        self.scope = scope
+        self.path = path
+        self.writable = writable          # False for managed/policy files
+        self.state = "missing"
+        self.raw = b""                    # exactly the bytes load() read
+        self.text = ""
+        self.data = None
+        self.error = None                 # dict for --json, also drives the report
+        self.findings = []
+        # Diagnosable but NOT rewritable: the file parses, so every finding in
+        # it is real and worth printing, but something in it cannot survive a
+        # json.dumps round trip. See _rewrite_blocker(). None means "fine".
+        self.rewrite_block = None
+
+    @property
+    def rewritable(self):
+        return self.rewrite_block is None
+
+    # -- read -------------------------------------------------------------
+    def load(self):
+        if not os.path.exists(self.path):
+            self.state = "missing"
+            return
+        try:
+            with open(self.path, "rb") as handle:
+                raw = self.raw = handle.read()
+        except Exception as exc:
+            self.state = "unreadable"
+            self.error = {"kind": "unreadable",
+                          "message": "%s: %s" % (type(exc).__name__, exc)}
+            return
+        try:
+            self.text = raw.decode("utf-8")
+        except Exception as exc:
+            self.state = "unreadable"
+            self.error = {"kind": "not-utf8",
+                          "message": "not valid UTF-8: %s" % exc}
+            return
+        literals = []
+        try:
+            # object_pairs_hook is not needed -- dict has preserved insertion
+            # order since 3.7 -- but the ORDER is load-bearing here (a
+            # reordered settings.json is its own kind of damage), so it is
+            # stated rather than assumed.
+            #
+            # parse_constant records the bare tokens NaN / Infinity / -Infinity.
+            # Python's json accepts all three; Node's JSON.parse -- which is
+            # what Claude Code reads settings with -- rejects them. We have to
+            # know they were there, because we must not hand them back.
+            self.data = json.loads(self.text, object_pairs_hook=_ordered,
+                                   parse_constant=lambda name: literals.append(name)
+                                   or _JSON_CONSTANTS.get(name))
+        except ValueError as exc:
+            self.state = "unparseable"
+            self.error = _parse_error(self.text, exc)
+            return
+        if not isinstance(self.data, dict):
+            self.state = "not-an-object"
+            self.error = {"kind": "not-an-object",
+                          "message": "the top level is a %s, and Claude Code's "
+                                     "settings must be a JSON object"
+                                     % type(self.data).__name__}
+            return
+        self.state = "ok"
+        self.rewrite_block = _rewrite_blocker(self.data, literals)
+
+
+_JSON_CONSTANTS = {"NaN": float("nan"),
+                   "Infinity": float("inf"),
+                   "-Infinity": float("-inf")}
+
+
+def _nonfinite_locations(value, trail=""):
+    """Every path in the document holding a float json.dumps cannot write.
+
+    Iterative rather than recursive: a settings.json nested a thousand deep is
+    valid JSON, and a rescue tool must not be the thing that raises
+    RecursionError on it.
+    """
+    found = []
+    stack = [(trail or "(root)", value)]
+    while stack:
+        where, node = stack.pop()
+        if isinstance(node, float):
+            if node != node or node in (float("inf"), float("-inf")):
+                found.append(where)
+        elif isinstance(node, dict):
+            for key, sub in node.items():
+                stack.append(("%s.%s" % (where, key), sub))
+        elif isinstance(node, list):
+            for index, sub in enumerate(node):
+                stack.append(("%s[%d]" % (where, index), sub))
+    return sorted(found)
+
+
+def _rewrite_blocker(data, literals):
+    """None when this document can be written back safely; else why it cannot.
+
+    THE FAILURE THIS PREVENTS. Python's json reads `1e999` as `inf` and writes
+    it back as the bare token `Infinity`. Python then reads `Infinity` again
+    quite happily -- so every check this tool ran passed, it printed "verified
+    on disk" and "repaired", and exited 0 over a settings.json that Node, and
+    therefore Claude Code, can no longer parse. One dead hook entry went in and
+    an unloadable configuration came out, which is the precise outcome this
+    file exists to prevent. The guard is here rather than only at the writer
+    because the honest answer is to say so BEFORE taking a backup and touching
+    anything.
+
+    Two shapes, and they are not the same problem:
+
+      * a NaN / Infinity / -Infinity LITERAL. Claude Code cannot read the file
+        as it stands -- this is already broken, and not in a way a hook removal
+        would fix.
+      * a finite literal that OVERFLOWS to infinity, `1e999`. Node reads this
+        file perfectly well (verified: JSON.parse gives Infinity). It is only
+        our rewrite that would break it, so leaving it alone is the whole fix.
+    """
+    if literals:
+        return {"kind": "json5-constant",
+                "tokens": sorted(set(literals)),
+                "message": "it contains the bare token(s) %s. Python's JSON "
+                           "reader accepts those; the JSON parser Claude Code "
+                           "uses does not, so this file is already unreadable "
+                           "to it -- and rewriting it would not change that."
+                           % ", ".join(sorted(set(literals)))}
+    spots = _nonfinite_locations(data)
+    if spots:
+        return {"kind": "overflowing-number",
+                "tokens": spots,
+                "message": "the number at %s is too large for JSON to hold "
+                           "(it reads as infinity). Claude Code can read this "
+                           "file as it stands, but anything that rewrote it "
+                           "would have to spell that number `Infinity`, which "
+                           "Claude Code cannot read. So it is left alone."
+                           % ", ".join(spots[:3])}
+    return None
+
+
+def _ordered(pairs):
+    """json's object hook. A later duplicate key wins, exactly as json does by
+    default, and the first occurrence keeps its position -- so a file with a
+    repeated key round-trips to the same document json handed us."""
+    out = {}
+    for key, value in pairs:
+        out[key] = value
+    return out
+
+
+def _parse_error(text, exc):
+    """A JSON syntax error somebody can actually act on.
+
+    A user staring at `Expecting ',' delimiter: line 14 column 3 (char 402)` in
+    a stack trace does not find the missing comma. The line itself, with a caret
+    under the column, does.
+    """
+    info = {"kind": "unparseable",
+            "message": str(getattr(exc, "msg", None) or exc),
+            "line": getattr(exc, "lineno", None),
+            "column": getattr(exc, "colno", None),
+            "source": None}
+    lines = text.splitlines()
+    line_no = info["line"]
+    if isinstance(line_no, int) and 1 <= line_no <= len(lines):
+        info["source"] = lines[line_no - 1]
+    if not text.strip():
+        # A genuinely empty settings.json is the commonest shape of this and the
+        # least obvious: it is not "settings with nothing in them", it is a
+        # syntax error, and the fix is two characters.
+        info["empty"] = True
+    return info
+
+
+# ---------------------------------------------------------------------------
+# reading a hook command
+# ---------------------------------------------------------------------------
+#
+# A Claude Code hook command is a shell string: "<interpreter> <script>", or a
+# bare executable, or -- for anything more ambitious -- a pipeline. Only the
+# first two shapes can be checked by stat'ing files, and guessing about the
+# third is how a working entry gets deleted. So a command with shell syntax in
+# it is reported as UNCHECKED and never as broken. This tool's failure mode
+# must be "said nothing", never "removed something that worked".
+
+_SHELL_SYNTAX = ("|", "&", ";", ">", "<", "`", "$(", "&&", "||", "\n")
+
+
+class Command(object):
+    def __init__(self, raw):
+        self.raw = raw
+        self.interpreter = None      # resolved absolute path, or None if unrunnable
+        self.interpreter_token = None
+        self.interpreter_where = None  # where it WOULD be, for the error message
+        self.script = None           # resolved absolute path, or None
+        self.script_token = None
+        self.unchecked = None        # why we declined to judge it
+
+
+def parse_command(raw, project_dir):
+    """Split a hook/statusLine command into the interpreter and the script.
+
+    Variables are expanded only when we KNOW the value: CLAUDE_PROJECT_DIR is
+    what Claude Code puts in a hook's environment, and from a bare shell we can
+    supply the project directory we resolved. An unexpandable variable makes the
+    command unchecked, not broken -- $SOME_TOOL_HOME is very likely correct in
+    the environment Claude Code actually runs the hook in.
+    """
+    cmd = Command(raw)
+    text = str(raw or "").strip()
+    if not text:
+        cmd.unchecked = "the command is empty"
+        return cmd
+    for token in _SHELL_SYNTAX:
+        if token in text:
+            cmd.unchecked = ("it contains shell syntax (%r), so which file it "
+                             "runs cannot be decided by looking at it" % token)
+            return cmd
+    try:
+        import shlex
+        parts = shlex.split(text)
+    except ValueError as exc:
+        cmd.unchecked = "it does not tokenise (%s)" % exc
+        return cmd
+    if not parts:
+        cmd.unchecked = "the command is empty"
+        return cmd
+
+    env = dict(os.environ)
+    if project_dir:
+        env.setdefault("CLAUDE_PROJECT_DIR", project_dir)
+    env.setdefault("CLAUDE_CONFIG_DIR", _claude_home())
+
+    expanded = []
+    for part in parts:
+        grown = _expand(part, env)
+        if grown is None:
+            cmd.unchecked = ("it names an environment variable this shell does "
+                             "not have set (%s)" % part)
+            return cmd
+        expanded.append(grown)
+
+    # One token is the executable itself. Two or more and the first token is the
+    # interpreter, and the script is the first argument that is not a flag --
+    # `python3 -u hooks/x.py` is as ordinary as `python3 hooks/x.py`.
+    if len(expanded) == 1:
+        cmd.script_token = parts[0]
+        # A lone bare name is a PATH lookup, not a relative path: `myhook` means
+        # whatever the shell would find, and joining it onto the cwd would
+        # invent a file nobody named.
+        if _has_sep(expanded[0]):
+            cmd.script = _resolve(expanded[0], project_dir)
+        else:
+            cmd.script = shutil.which(expanded[0]) or _resolve(expanded[0],
+                                                               project_dir)
+        return cmd
+    cmd.interpreter_token = parts[0]
+    cmd.interpreter, cmd.interpreter_where = _resolve_program(expanded[0])
+    if _is_wrapper(expanded[0]):
+        cmd.unchecked = ("%s is a launcher: the word after it is a subcommand "
+                         "or another program, not a file, so what this ends up "
+                         "running cannot be decided by looking at it"
+                         % os.path.basename(expanded[0]))
+        return cmd
+    for token, grown in zip(parts[1:], expanded[1:]):
+        if grown.startswith("-"):
+            # `-c` takes code, not a path: past it there is no script to stat.
+            if grown in ("-c", "-m", "-e"):
+                cmd.unchecked = ("it runs inline code (%s), so there is no "
+                                 "script file to check" % grown)
+                return cmd
+            continue
+        if "=" in grown and not _has_sep(grown.split("=", 1)[0]):
+            # `env A=1 python3 x.py` -- and `A=1 python3 x.py` once a shell has
+            # been involved. An assignment is not the script.
+            cmd.unchecked = ("it sets an environment variable inline (%s), so "
+                             "the program it runs is further along than this "
+                             "tool can follow" % grown.split("=", 1)[0])
+            return cmd
+        if not _could_be_a_script(grown):
+            # THE RULE: accept the first non-flag token as the script only when
+            # it CAN be one. `uv run x.py` and `npx tsx x.ts` put a subcommand
+            # here, and taking it literally invented the paths `<cwd>/run` and
+            # `<cwd>/tsx`, which of course do not exist -- so three working
+            # registrations were reported broken, and `--all --yes`, which the
+            # tool printed as the next step, deleted them. Abstaining is the
+            # answer this file already has for everything undecidable.
+            cmd.unchecked = ("the word after %s (%r) is not a file path, so "
+                             "what this runs cannot be decided by looking at it"
+                             % (os.path.basename(expanded[0]), grown))
+            return cmd
+        cmd.script_token = token
+        cmd.script = _resolve(grown, project_dir)
+        # Stop at the FIRST non-flag argument. Everything after it is an
+        # argument to the program, not another program, and a missing file
+        # there is the program's business -- `statusline.py --config gone.json`
+        # still starts, and deleting that registration would take a working
+        # status line away to report somebody else's bug.
+        break
+    return cmd
+
+
+def _expand(text, env):
+    """os.path.expandvars against a KNOWN environment, returning None when a
+    variable is not in it. expandvars leaves unknown names untouched, which
+    would make '$NOPE/x.py' look like a relative path that does not exist --
+    a false positive, on a tool whose false positives delete configuration."""
+    out = os.path.expanduser(text)
+    if "$" not in out:
+        return out
+    import re
+    pattern = re.compile(r"\$(\w+)|\$\{([^}]*)\}")
+    missing = []
+
+    def _sub(match):
+        name = match.group(1) or match.group(2) or ""
+        if name in env:
+            return env[name]
+        missing.append(name)
+        return match.group(0)
+
+    out = pattern.sub(_sub, out)
+    return None if missing else out
+
+
+def _resolve(path, project_dir):
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    base = project_dir or os.getcwd()
+    return os.path.normpath(os.path.join(base, path))
+
+
+def _has_sep(token):
+    return os.sep in token or bool(os.altsep and os.altsep in token)
+
+
+#: Programs whose FIRST argument is a subcommand or ANOTHER PROGRAM, never a
+#: script. Reading it as a path invents a file that was never registered, and
+#: an invented missing file is a removable finding -- so this list is the
+#: difference between "said nothing" and "deleted a working hook".
+#:
+#: _could_be_a_script() already catches most of these on its own (`run`, `tsx`
+#: and `exec` are not file names), so the list is the belt for the case that
+#: predicate cannot see: a prefix runner handed an ABSOLUTE interpreter path,
+#: `nohup /opt/py310/bin/python3 hook.py`, where the second token looks exactly
+#: like a script and a retired interpreter would read as a missing script and
+#: be deleted.
+#:
+#: Shells are deliberately NOT here. `bash hooks/x.sh` puts the script in
+#: exactly the position this file expects, and `bash -c ...` is already handled
+#: as inline code -- so a missing x.sh there is the unambiguous case REMOVABLE
+#: exists for, and listing bash would throw that diagnosis away.
+_WRAPPERS = frozenset({
+    "env", "uv", "uvx", "npx", "pnpm", "npm", "yarn", "bun", "bunx", "deno",
+    "poetry", "pipenv", "pdm", "hatch", "rye", "nice", "ionice", "timeout",
+    "sudo", "doas", "nohup", "stdbuf", "xargs", "command", "exec", "time",
+    "jq", "flock", "setsid",
+})
+
+#: Suffixes that make a bare word (no directory in it) a plausible script name.
+_SCRIPT_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".sh", ".bash",
+                    ".zsh", ".rb", ".pl", ".lua", ".php", ".exe")
+
+
+def _is_wrapper(token):
+    name = os.path.basename(token or "")
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name in _WRAPPERS
+
+
+def _could_be_a_script(token):
+    """Is this token something that could name a file at all?
+
+    Yes when it carries a directory, ends in a script suffix, or is simply
+    there on disk. A bare word that is none of those -- `run`, `tsx`, `exec` --
+    is a subcommand, and resolving it against the current directory is how this
+    tool invented paths like `<cwd>/run` and then called them missing.
+    """
+    if not token:
+        return False
+    if _has_sep(token) or token.startswith("~"):
+        return True
+    if token.lower().endswith(_SCRIPT_SUFFIXES):
+        return True
+    return os.path.exists(token)
+
+
+def _resolve_program(token):
+    """(a program that will actually run, where it was looked for).
+
+    Returns None for the first element when nothing runnable is there, and the
+    caller turns that into the finding. RUNNABLE, not merely present: returning
+    the normalised path for any absolute token would report
+    `/nonexistent/python3 hooks/session_start.py` -- the exact shape of a pyenv
+    version that was uninstalled -- as healthy. An interpreter has to exist AND
+    be executable, because a shell that cannot exec it fails the hook just as
+    completely as a missing file.
+
+    A bare name is looked up on PATH exactly as the shell would, since `python3`
+    can vanish as completely as an absolute path when PATH changes.
+    """
+    if _has_sep(token):
+        path = os.path.normpath(os.path.abspath(os.path.expanduser(token)))
+        runnable = os.path.isfile(path) and os.access(path, os.X_OK)
+        return (path if runnable else None), path
+    found = shutil.which(token)
+    return (os.path.normpath(found) if found else None), token
+
+
+def _shebang(path):
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(2)
+        return head == b"#!"
+    except Exception:
+        return False
+
+
+def _is_binary(path):
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4)
+        return head[:4] == b"\x7fELF" or head[:2] == b"MZ" or head[:4] == b"\xcf\xfa\xed\xfe"
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# findings
+# ---------------------------------------------------------------------------
+
+#: Kinds we will remove. Every one of them means the entry cannot run and the
+#: thing to delete is unambiguous. The advisory kinds are NOT here on purpose: a
+#: hook whose script exists but lacks +x is fixed with chmod, and deleting the
+#: registration would throw away a working configuration to solve a one-command
+#: problem. `malformed-root` is not here either -- "hooks" being a string is a
+#: top-level key full of content nobody can interpret, and guessing at it is
+#: exactly what this file must not do.
+REMOVABLE = ("missing-script", "missing-interpreter", "malformed")
+
+SEVERITY = {
+    "missing-script": "broken",
+    "missing-interpreter": "broken",
+    "malformed": "broken",
+    "malformed-root": "broken",
+    "not-executable": "advisory",
+    "no-shebang": "advisory",
+    "script-is-directory": "advisory",
+    "directory-entrypoint": "info",
+    "unchecked": "info",
+}
+
+
+class Finding(object):
+    """One thing that is wrong, and -- when it can be repaired -- exactly what
+    to delete.
+
+    `target` is the load-bearing field, and it is recorded when the finding is
+    built rather than recovered later by re-parsing `where`. A regex over
+    `where` matches only the deepest shape, so a malformed matcher GROUP
+    produces a finding, is counted as repairable, and then plans no change at
+    all -- and `--all --yes` prints 'repaired' over a file it has not touched.
+    A finding that cannot say what to delete cannot claim to be repairable.
+
+        ("entry", event, group_index, entry_index)
+        ("group", event, group_index)
+        ("event", event)
+        ("statusline",)
+        None -- report only
+    """
+
+    def __init__(self, scope, path, where, kind, detail, fix,
+                 ours=False, command="", writable=True, target=None):
+        self.scope = scope
+        self.path = path
+        self.where = where            # hooks.PreToolUse[0].hooks[0]
+        self.kind = kind
+        self.detail = detail
+        self.fix = fix
+        self.ours = ours
+        self.command = command
+        self.writable = writable
+        self.target = target
+        self.removed = False
+
+    @property
+    def severity(self):
+        return SEVERITY.get(self.kind, "broken")
+
+    @property
+    def removable(self):
+        return bool(self.writable and self.target and self.kind in REMOVABLE)
+
+    def as_dict(self):
+        return {"scope": self.scope, "path": self.path, "where": self.where,
+                "kind": self.kind, "severity": self.severity,
+                "owner": "ours" if self.ours else "other",
+                "command": self.command, "detail": self.detail, "fix": self.fix,
+                "target": list(self.target) if self.target else None,
+                "removable": self.removable, "removed": self.removed}
+
+
+def _owned_by(root, cmd):
+    """Is this entry OURS?
+
+    Ownership is decided by the path in the command, not by the name of the
+    script: another tool is perfectly entitled to have a session_start.py. The
+    script is the signal (the interpreter is usually somebody's pyenv), with the
+    interpreter as a fallback for the case where the script could not be
+    resolved at all.
+
+    When this file has been copied out of its checkout there is no install root
+    to compare against and every entry reads as another tool's. That is the
+    honest answer, and main() says so out loud rather than guessing -- pass
+    --root to name the checkout, or --all to act anyway.
+    """
+    if not root:
+        return False
+    root = os.path.normpath(root)
+    for candidate in (cmd.script, cmd.interpreter):
+        if not candidate:
+            continue
+        if candidate == root or candidate.startswith(root + os.sep):
+            return True
+    return False
+
+
+def diagnose_command(sf, where, raw, root, project_dir, label, target):
+    """Every way a "<interpreter> <script>" string can fail to run, as findings.
+
+    `label` is what to call the thing in prose: 'hook' or 'statusLine'. Both
+    fail identically -- a statusLine whose command is gone is the same missing
+    file as a hook whose command is gone -- so they are checked by the same
+    code rather than by two copies that can drift. `target` is what a repair
+    would delete, and only the findings that a repair CAN act on carry it.
+    """
+    out = []
+    cmd = parse_command(raw, project_dir)
+    ours = _owned_by(root, cmd)
+    if cmd.unchecked:
+        out.append(Finding(sf.scope, sf.path, where, "unchecked",
+                           "not checked: %s" % cmd.unchecked,
+                           "look at it by hand if this %s is misbehaving" % label,
+                           ours=ours, command=raw, writable=sf.writable))
+        return out
+
+    # The interpreter first. It is the half people forget to stat, and it fails
+    # exactly as loudly as the script: an uninstalled pyenv version breaks every
+    # tool call with a message about the SCRIPT's path, which sends the reader
+    # to a file that is sitting right there.
+    if cmd.interpreter_token is not None and cmd.interpreter is None:
+        looked_in = cmd.interpreter_where or cmd.interpreter_token
+        if not _has_sep(looked_in):
+            why = "the interpreter %s is not on PATH" % looked_in
+        elif os.path.exists(looked_in):
+            why = "the interpreter %s exists but is not executable" % looked_in
+        else:
+            why = "the interpreter %s does not exist" % looked_in
+        out.append(Finding(
+            sf.scope, sf.path, where, "missing-interpreter",
+            "%s (the script it would run, %s, may be perfectly fine)"
+            % (why, cmd.script_token or "?"),
+            "install that interpreter, repoint the command at one you have, or "
+            "remove the entry",
+            ours=ours, command=raw, writable=sf.writable, target=target))
+        return out
+
+    if cmd.script is None:
+        out.append(Finding(sf.scope, sf.path, where, "unchecked",
+                           "not checked: no script path could be read out of the "
+                           "command",
+                           "look at it by hand if this %s is misbehaving" % label,
+                           ours=ours, command=raw, writable=sf.writable))
+        return out
+
+    if not os.path.exists(cmd.script):
+        out.append(Finding(
+            sf.scope, sf.path, where, "missing-script",
+            "the %s it runs does not exist: %s" % (label, cmd.script),
+            "restore that file, or remove the entry",
+            ours=ours, command=raw, writable=sf.writable, target=target))
+        return out
+
+    if os.path.isdir(cmd.script):
+        # ADVISORY, never removable. `python3 <dir>` runs <dir>/__main__.py and
+        # `node <dir>` resolves <dir>/package.json main or index.js: pointing an
+        # interpreter at a directory is a working invocation, not a typo.
+        # Classing it as a missing script -- which is removable -- would make a
+        # directory under the checkout read as OURS and delete a working hook on
+        # the plain `--yes` path, with no flag at all. REMOVABLE is
+        # documented to mean "the file it names is gone", and this is not that.
+        runner = os.path.basename(cmd.interpreter_token or "")
+        entries = []
+        if runner.startswith("python"):
+            entries = [os.path.join(cmd.script, "__main__.py")]
+        elif runner.startswith("node") or runner.startswith("bun") \
+                or runner.startswith("deno"):
+            entries = [os.path.join(cmd.script, "package.json"),
+                       os.path.join(cmd.script, "index.js")]
+        present = [e for e in entries if os.path.exists(e)]
+        if present:
+            # It runs. Say so and move on -- an entry this tool can see working
+            # must not be counted against the run, or a healthy machine exits
+            # non-zero and the user goes looking for a problem that is not there.
+            out.append(Finding(
+                sf.scope, sf.path, where, "directory-entrypoint",
+                "not checked further: %s is a directory, and %s runs it via %s"
+                % (cmd.script, runner, os.path.basename(present[0])),
+                "nothing to do -- this is a working invocation",
+                ours=ours, command=raw, writable=sf.writable))
+            return out
+        hint = (" (expected %s)" % ", ".join(os.path.basename(e) for e in entries)
+                if entries else "")
+        out.append(Finding(
+            sf.scope, sf.path, where, "script-is-directory",
+            "%s is a directory, and no entry point %s would run was found in "
+            "it%s" % (cmd.script, runner or "it", hint),
+            "put the entry point there, or repoint the command at a file -- "
+            "this is NOT removed automatically, because a directory is a "
+            "legitimate thing to hand an interpreter",
+            ours=ours, command=raw, writable=sf.writable))
+        return out
+
+    # With no interpreter in front of it the script has to be able to run
+    # itself. Both of these are REPORTED and never removed: the file is there,
+    # the user meant to run it, and one command fixes it.
+    if cmd.interpreter_token is None:
+        if not os.access(cmd.script, os.X_OK):
+            out.append(Finding(
+                sf.scope, sf.path, where, "not-executable",
+                "%s exists but is not executable, and nothing in the command "
+                "would interpret it" % cmd.script,
+                "chmod +x %s" % _quote(cmd.script),
+                ours=ours, command=raw, writable=sf.writable))
+        elif not _shebang(cmd.script) and not _is_binary(cmd.script):
+            out.append(Finding(
+                sf.scope, sf.path, where, "no-shebang",
+                "%s is executable but starts with neither a #! line nor a known "
+                "binary header, so what runs it is up to the shell"
+                % cmd.script,
+                "add a #! line (for example '#!/usr/bin/env python3'), or put the "
+                "interpreter in front of it in the command",
+                ours=ours, command=raw, writable=sf.writable))
+    return out
+
+
+def _quote(path):
+    return path if all(ch not in path for ch in " \t\"'$`\\") else json.dumps(path)
+
+
+# ---------------------------------------------------------------------------
+# walking a settings document
+# ---------------------------------------------------------------------------
+#
+# Shape is checked at every level. A settings.json is hand-edited, and the
+# shapes below have all been seen: a string where the hooks list belongs, an
+# entry with no "command" key, a null sitting in the list. None of them may
+# raise -- a repair tool that crashes on a malformed file is a repair tool that
+# does not run on the machines that need it most.
+
+def diagnose(sf, root, project_dir):
+    if sf.state != "ok":
+        return
+
+    hooks = sf.data.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        # No target: "hooks" being a string is a top-level key holding content
+        # nobody can interpret, and this tool does not delete top-level keys it
+        # cannot read. Reported, never removed, not even under --all.
+        sf.findings.append(Finding(
+            sf.scope, sf.path, "hooks", "malformed-root",
+            "\"hooks\" is a %s; Claude Code expects an object of event name -> "
+            "list" % type(hooks).__name__,
+            "fix it by hand -- this is not something to guess at",
+            ours=False, command="", writable=sf.writable))
+        hooks = None
+
+    if isinstance(hooks, dict):
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                sf.findings.append(Finding(
+                    sf.scope, sf.path, "hooks.%s" % event, "malformed",
+                    "the %s entry is a %s; Claude Code expects a list of matcher "
+                    "groups" % (event, type(groups).__name__),
+                    "fix it by hand, or remove the event with --all",
+                    ours=False, command="", writable=sf.writable,
+                    target=("event", event)))
+                continue
+            for gi, group in enumerate(groups):
+                where_group = "hooks.%s[%d]" % (event, gi)
+                if not isinstance(group, dict):
+                    sf.findings.append(Finding(
+                        sf.scope, sf.path, where_group, "malformed",
+                        "this matcher group is a %s, not an object"
+                        % type(group).__name__,
+                        "fix it by hand, or remove the group with --all",
+                        ours=False, command="", writable=sf.writable,
+                        target=("group", event, gi)))
+                    continue
+                entries = group.get("hooks")
+                if not isinstance(entries, list):
+                    sf.findings.append(Finding(
+                        sf.scope, sf.path, where_group + ".hooks", "malformed",
+                        "the group's \"hooks\" is a %s, not a list"
+                        % type(entries).__name__,
+                        "fix it by hand, or remove the group with --all",
+                        ours=False, command="", writable=sf.writable,
+                        target=("group", event, gi)))
+                    continue
+                for ei, entry in enumerate(entries):
+                    where = "%s.hooks[%d]" % (where_group, ei)
+                    target = ("entry", event, gi, ei)
+                    if not isinstance(entry, dict):
+                        sf.findings.append(Finding(
+                            sf.scope, sf.path, where, "malformed",
+                            "this hook entry is a %s, not an object"
+                            % type(entry).__name__,
+                            "fix it by hand, or remove the entry with --all",
+                            ours=False, command="", writable=sf.writable,
+                            target=target))
+                        continue
+                    raw = entry.get("command")
+                    if not isinstance(raw, str) or not raw.strip():
+                        sf.findings.append(Finding(
+                            sf.scope, sf.path, where, "malformed",
+                            "this hook entry has no usable \"command\" (%s)"
+                            % json.dumps(raw),
+                            "fix it by hand, or remove the entry with --all",
+                            ours=False, command="", writable=sf.writable,
+                            target=target))
+                        continue
+                    sf.findings.extend(diagnose_command(
+                        sf, where, raw, root, project_dir, "hook script", target))
+
+    status = sf.data.get("statusLine")
+    if status is None:
+        return
+    if not isinstance(status, dict):
+        sf.findings.append(Finding(
+            sf.scope, sf.path, "statusLine", "malformed",
+            "\"statusLine\" is a %s, not an object" % type(status).__name__,
+            "fix it by hand, or remove it with --all",
+            ours=False, command="", writable=sf.writable,
+            target=("statusline",)))
+        return
+    raw = status.get("command")
+    if not isinstance(raw, str) or not raw.strip():
+        sf.findings.append(Finding(
+            sf.scope, sf.path, "statusLine", "malformed",
+            "\"statusLine\" has no usable \"command\" (%s)" % json.dumps(raw),
+            "fix it by hand, or remove it with --all",
+            ours=False, command="", writable=sf.writable,
+            target=("statusline",)))
+        return
+    sf.findings.extend(diagnose_command(
+        sf, "statusLine", raw, root, project_dir, "statusLine program",
+        ("statusline",)))
+
+
+# ---------------------------------------------------------------------------
+# repairing a settings document
+# ---------------------------------------------------------------------------
+
+def plan_repair(sf, findings):
+    """Build the repaired document, and describe every change in one line each.
+
+    MARK, THEN SWEEP -- never pop by index while walking. Popping entries in
+    reverse index order is correct for entries alone but silently wrong the
+    moment a group or a whole event is also being removed: every pending index
+    behind it shifts. Collecting the deletions first and rebuilding each list
+    once cannot get that wrong, and it makes "which container did WE empty"
+    answerable, which is the other half of the contract.
+
+    An emptied container goes with its contents -- a group with no hooks left,
+    then an event with no groups left -- but only when this run emptied it. A
+    matcher group that was already empty before we arrived is somebody's
+    deliberate placeholder and none of our business.
+
+    The one container never removed is "hooks" itself. It is a top-level key the
+    user wrote, and taking a top-level key away is a bigger surprise than
+    leaving an empty object behind; the output says so rather than doing it
+    quietly.
+    """
+    import copy
+    document = copy.deepcopy(sf.data)
+    changes = []
+
+    drop_statusline = None
+    drop_events = set()                  # event
+    drop_groups = set()                  # (event, group_index)
+    drop_entries = {}                    # (event, group_index) -> {entry_index}
+    reason = {}                          # where -> the finding, for the change line
+    for finding in findings:
+        target = finding.target
+        if not target:
+            continue
+        reason[finding.where] = finding
+        if target[0] == "statusline":
+            drop_statusline = finding
+        elif target[0] == "event":
+            drop_events.add(target[1])
+        elif target[0] == "group":
+            drop_groups.add((target[1], target[2]))
+        elif target[0] == "entry":
+            drop_entries.setdefault((target[1], target[2]), set()).add(target[3])
+
+    def why(where, fallback):
+        finding = reason.get(where)
+        if finding is None:
+            return fallback
+        return _clip(finding.command or finding.detail, 76)
+
+    hooks = document.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            if event in drop_events:
+                hooks.pop(event, None)
+                changes.append("remove the malformed hook event hooks.%s  (%s)"
+                               % (event, why("hooks.%s" % event, "malformed")))
+                continue
+            groups = hooks.get(event)
+            if not isinstance(groups, list):
+                continue
+            kept = []
+            emptied_by_us = False
+            for gi, group in enumerate(groups):
+                where_group = "hooks.%s[%d]" % (event, gi)
+                if (event, gi) in drop_groups:
+                    changes.append("remove the malformed matcher group %s  (%s)"
+                                   % (where_group,
+                                      why(where_group,
+                                          why(where_group + ".hooks", "malformed"))))
+                    emptied_by_us = True
+                    continue
+                wanted = drop_entries.get((event, gi))
+                if wanted and isinstance(group, dict) and \
+                        isinstance(group.get("hooks"), list):
+                    entries = group["hooks"]
+                    for ei in sorted(wanted):
+                        if 0 <= ei < len(entries):
+                            where = "%s.hooks[%d]" % (where_group, ei)
+                            changes.append("remove %s  (%s)"
+                                           % (where, why(where, "broken")))
+                    group["hooks"] = [entry for ei, entry in enumerate(entries)
+                                      if ei not in wanted]
+                    if not group["hooks"]:
+                        changes.append("remove the now-empty matcher group %s"
+                                       % where_group)
+                        emptied_by_us = True
+                        continue
+                kept.append(group)
+            if kept:
+                hooks[event] = kept
+            elif emptied_by_us:
+                hooks.pop(event, None)
+                changes.append("remove the now-empty hook event hooks.%s" % event)
+            else:
+                hooks[event] = kept
+
+    if drop_statusline is not None:
+        document.pop("statusLine", None)
+        changes.append("remove \"statusLine\"  (%s)" % drop_statusline.detail)
+
+    if isinstance(document.get("hooks"), dict) and not document["hooks"]:
+        changes.append("note: \"hooks\" is now an empty object. It is left in "
+                       "place -- removing a top-level key you wrote is not this "
+                       "tool's call.")
+    return document, changes
+
+
+# ---------------------------------------------------------------------------
+# writing
+# ---------------------------------------------------------------------------
+
+def detect_indent(text):
+    """The indent the file already uses, so a repair does not reformat it.
+
+    json.dumps cannot preserve everything -- key order it can (dicts keep
+    insertion order), indentation it can if we measure it, and comments,
+    trailing commas and blank-line grouping it cannot, because json never
+    parsed them in the first place. The caller says all of that out loud.
+    """
+    for line in text.splitlines()[1:]:
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped[0] in "}]":
+            continue
+        lead = line[:len(line) - len(stripped)]
+        if lead.startswith("\t"):
+            return "\t"
+        if lead:
+            return len(lead)
+        break
+    return 2
+
+
+def render(document, original_text):
+    """The repaired document as text -- or ValueError rather than bad JSON.
+
+    allow_nan=False is the whole guard. Left at its default, json.dumps emits
+    the bare tokens `NaN` / `Infinity` / `-Infinity`, which are Python's
+    extension to JSON and are rejected by Node -- so the default would let this
+    tool write a settings.json that Claude Code cannot read while every check
+    it runs (all of them Python) says the file is fine. Raising here means the
+    caller's existing failure path refuses the write instead.
+    """
+    indent = detect_indent(original_text) if original_text else 2
+    out = json.dumps(document, indent=indent, ensure_ascii=False, allow_nan=False)
+    # Match the file's own ending. A settings.json that had no trailing newline
+    # should not grow one just because it was repaired.
+    if not original_text or original_text.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def _reject_constant(name):
+    raise ValueError("the token %s is not JSON that Claude Code can read" % name)
+
+
+def strict_loads(text):
+    """json.loads under NODE's rules, not Python's.
+
+    Python's json is a superset: it accepts NaN, Infinity and -Infinity, which
+    JSON.parse rejects. Verifying our own output with the reader that produced
+    it is circular -- it proved only that Python agrees with Python, which is
+    how `Infinity` reached a user's settings.json under a "verified on disk"
+    line. Raises ValueError on anything Node would refuse.
+    """
+    return json.loads(text, parse_constant=_reject_constant)
+
+
+def _node_binary():
+    """A node interpreter to check our output with, if the machine has one.
+
+    Never required. This file's contract is that it runs with nothing but the
+    standard library on a machine that is already broken, so node is used when
+    it happens to be there and its absence is not a failure -- strict_loads()
+    is the check that always runs.
+    """
+    for name in ("node", "nodejs"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _node_accepts(path):
+    """(verdict, detail) from a real JSON.parse, or (None, why) if none ran.
+
+    This is the only verification in the file that is not performed by the
+    program that wrote the bytes, which is the point of it.
+    """
+    node = _node_binary()
+    if not node:
+        return None, "no node interpreter on PATH"
+    import subprocess
+    script = ("var fs=require('fs');"
+              "try{JSON.parse(fs.readFileSync(process.argv[1],'utf8'));"
+              "console.log('OK')}"
+              "catch(e){console.log('ERR '+e.message.split('\\n')[0]);"
+              "process.exitCode=1}")
+    try:
+        done = subprocess.run([node, "-e", script, path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=20)
+    except Exception as exc:
+        return None, "could not run node (%s: %s)" % (type(exc).__name__, exc)
+    reply = (done.stdout or b"").decode("utf-8", "replace").strip()
+    if done.returncode == 0 and reply.startswith("OK"):
+        return True, os.path.basename(node)
+    return False, reply[3:].strip() or "JSON.parse refused it"
+
+
+def next_backup(path):
+    """settings.json.bak-1, then .bak-2 ... never reusing a number.
+
+    A timestamp would be prettier and would also let two runs in the same second
+    overwrite each other. A counter that stops at the first unused name cannot
+    destroy an existing backup, which is the only property that matters here.
+    """
+    counter = 1
+    while True:
+        candidate = "%s.bak-%d" % (path, counter)
+        # lexists, not exists: exists() follows symlinks, so a DANGLING backup
+        # name read as "free" and the copy was then written THROUGH the link,
+        # landing wherever it pointed while the output said ~/.claude. The
+        # backup is the safety net; it has to be where the run says it is.
+        if not os.path.lexists(candidate):
+            return candidate
+        counter += 1
+
+
+def atomic_write(path, text):
+    """Temp file in the same directory, fsync, os.replace.
+
+    Same directory because os.replace is only atomic within a filesystem, and
+    atomic because the alternative -- open(path, 'w') -- truncates the user's
+    settings the instant it is called. An interrupt one line later would then
+    leave an empty settings.json, which is the failure this whole file exists to
+    undo.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle, temp = tempfile.mkstemp(prefix=".oe-repair.", dir=directory)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        if os.path.exists(path):
+            shutil.copystat(path, temp)
+        os.replace(temp, path)
+        temp = None
+    finally:
+        if temp and os.path.exists(temp):
+            try:
+                os.unlink(temp)
+            except Exception:
+                pass
+
+
+def untouched_keys(before, after, managed):
+    """Every top-level key we did not claim must be identical, and in order.
+
+    Serialised with sort_keys so that a nested reordering is not mistaken for a
+    change, and compared as a LIST so that a reordering at the top level is.
+    This is the check that turns "we only removed the broken entry" from a
+    claim into something the run can prove and print.
+    """
+    problems = []
+    before_keys = [k for k in before if k not in managed]
+    after_keys = [k for k in after if k not in managed]
+    if before_keys != after_keys:
+        lost = [k for k in before_keys if k not in after_keys]
+        gained = [k for k in after_keys if k not in before_keys]
+        if lost:
+            problems.append("KEYS LOST: %s" % ", ".join(lost))
+        if gained:
+            problems.append("unexpected new keys: %s" % ", ".join(gained))
+        if not lost and not gained:
+            problems.append("key ORDER changed: %s -> %s"
+                            % (before_keys, after_keys))
+    for key in before_keys:
+        if key in after_keys and json.dumps(before[key], sort_keys=True) != \
+                json.dumps(after[key], sort_keys=True):
+            problems.append("key modified: %s" % key)
+    return problems
+
+
+#: v1.0.0 diagnoses only. See "WHY THIS BUILD DOES NOT WRITE" above.
+WRITES_ENABLED = False
+
+
+def write_repair(sf, document, changes):
+    """Back up, write, read back, and roll back if the result is not what we meant.
+
+    Order is the contract: nothing is written until the file on disk is still
+    the file we diagnosed, the rendered text is provably valid, a backup exists
+    AND has been re-read and proved byte-identical to the original. A backup we
+    did not verify is not a backup, it is a hope.
+    """
+    if not WRITES_ENABLED:
+        # Reached only if a caller bypassed the check in main(). Refusing here
+        # too is the point: this function deletes hook registrations, and the
+        # failure mode of the code that decides WHICH ones is a machine on
+        # which no tool call works.
+        raise RuntimeError(
+            "write_repair() called in a diagnose-only build; refusing to "
+            "modify %s" % sf.path)
+    # -- 0. which file are we actually writing? -----------------------------
+    #
+    # A ~/.claude/settings.json symlinked into a dotfiles repo is an ordinary
+    # layout, and os.replace() on the link destroys it: the link becomes a
+    # regular file, the dotfiles copy keeps the broken hook, and the next
+    # `stow`/`chezmoi apply` puts the breakage back -- after this tool said it
+    # was fixed. The .bak-N cannot undo that, because it is a copy of the
+    # CONTENT and what was lost is the file's identity. So resolve once and
+    # repair the file the link points at.
+    target = sf.path
+    if os.path.islink(sf.path):
+        real = os.path.realpath(sf.path)
+        if not os.path.exists(real):
+            fail("%s is a symlink to %s, and nothing is there. Repairing it "
+                 "would replace your link with a regular file; fix the link "
+                 "first. Nothing was written." % (sf.path, real))
+            return None, 1
+        target = real
+        say("  symlink     %s" % sf.path)
+        say("              -> writing %s, so the link survives" % target)
+        say("              (commit that file if it is under version control)")
+
+    # -- 1. is the file still the one we diagnosed? -------------------------
+    #
+    # Everything below was planned against the snapshot load() took at the
+    # start of the run. An editor saving settings.json, `/hooks` in a surviving
+    # Claude Code session, or a second oe-repair with different flags all land
+    # inside that window -- and without this check their edit is silently
+    # overwritten while the run prints "verified on disk: N/N other top-level
+    # key(s) byte-identical", a claim about a file that no longer exists.
+    try:
+        with open(target, "rb") as handle:
+            current = handle.read()
+    except FileNotFoundError:
+        fail("%s has been deleted since this run started. Nothing was written "
+             "-- run this again." % target)
+        return None, 1
+    except Exception as exc:
+        fail("could not re-read %s before writing (%s: %s); refusing to write."
+             % (target, type(exc).__name__, exc))
+        return None, 1
+    if current != sf.raw:
+        fail("%s changed while this was running, so the repair was planned "
+             "against a file that is no longer there. Nothing was written -- "
+             "run this again." % target)
+        return None, 1
+
+    # -- 2. render BEFORE the backup ---------------------------------------
+    #
+    # render() refuses to emit Python's non-JSON tokens, and a refusal must
+    # cost the user nothing: no backup file, no touched settings.
+    try:
+        text = render(document, sf.text)
+    except ValueError as exc:
+        fail("cannot rewrite %s safely: %s. Nothing was written." % (target, exc))
+        return None, 1
+    try:
+        strict_loads(text)
+    except ValueError as exc:
+        fail("the repaired text would not be valid JSON (%s). This is a bug in "
+             "oe-repair. Nothing was written." % exc)
+        return None, 1
+
+    # -- 3. backup ----------------------------------------------------------
+    backup = None
+    if os.path.exists(target):
+        backup = next_backup(target)
+        try:
+            shutil.copy2(target, backup)
+            with open(backup, "rb") as handle:
+                copied = handle.read()
+            with open(target, "rb") as handle:
+                original = handle.read()
+        except Exception as exc:
+            fail("could not take a backup of %s (%s); refusing to write."
+                 % (target, exc))
+            return None, 1
+        if copied != original:
+            fail("the backup at %s does not match the original byte for byte; "
+                 "refusing to write." % backup)
+            return None, 1
+        say("  backup      %s" % backup)
+
+    # -- 4. write -----------------------------------------------------------
+    try:
+        atomic_write(target, text)
+    except Exception as exc:
+        fail("write failed: %s: %s" % (type(exc).__name__, exc))
+        _rollback(target, backup)
+        return backup, 1
+
+    # -- 5. verify, and NOT with the reader that wrote it -------------------
+    #
+    # Read back from disk, not from memory: the thing being verified is the
+    # FILE, and "the variable I just built is the variable I just built" proves
+    # nothing about what landed. strict_loads applies Node's rules rather than
+    # Python's, and where a node interpreter exists it gets the last word --
+    # the only check here the writer did not perform on itself.
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            written = strict_loads(handle.read())
+    except Exception as exc:
+        fail("could not re-read what we wrote (%s: %s)" % (type(exc).__name__, exc))
+        _rollback(target, backup)
+        return backup, 1
+
+    node_ok, node_detail = _node_accepts(target)
+    if node_ok is False:
+        fail("the file we wrote is rejected by JSON.parse (%s), which is the "
+             "parser Claude Code reads settings with." % node_detail)
+        _rollback(target, backup)
+        return backup, 1
+
+    managed = {"hooks", "statusLine"}
+    problems = untouched_keys(sf.data, written, managed) \
+        if isinstance(written, dict) else ["the written file is not a JSON object"]
+    if isinstance(written, dict) and written != document:
+        problems.append("the file on disk is not the document we planned")
+    if problems:
+        fail("WROTE A FILE THAT FAILS VERIFICATION:")
+        for problem in problems:
+            fail("    " + problem)
+        _rollback(target, backup)
+        return backup, 1
+
+    preserved = [k for k in sf.data if k not in managed]
+    say("  wrote       %s" % target)
+    say("  verified on disk: %d/%d other top-level key(s) byte-identical and in "
+        "the original order" % (len(preserved), len(preserved)))
+    if node_ok:
+        say("  verified by %s: JSON.parse reads it -- so Claude Code will too"
+            % node_detail)
+    else:
+        say("  (%s, so the JSON check was this tool's own strict reader only)"
+            % node_detail)
+    return backup, 0
+
+
+def _rollback(path, backup):
+    if not backup or not os.path.exists(backup):
+        fail("NO BACKUP TO RESTORE. %s is as the failed write left it." % path)
+        return
+    try:
+        shutil.copy2(backup, path)
+        fail("ROLLED BACK: restored %s from %s" % (path, backup))
+    except Exception as exc:
+        fail("COULD NOT RESTORE %s from %s: %s: %s"
+             % (path, backup, type(exc).__name__, exc))
+        fail("your original settings are intact at %s -- copy it back by hand."
+             % backup)
+
+
+def _clip(text, width):
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[:width - 1] + "\u2026"
+
+
+# ---------------------------------------------------------------------------
+# the run
+# ---------------------------------------------------------------------------
+
+def collect_files(args):
+    """Every settings file Claude Code merges, in the order it merges them.
+
+    Not one file: an install can land in any of the three writable scopes, and a
+    broken hook in the project scope breaks that checkout just as completely as
+    one in the user scope. The managed/policy files are appended read-only --
+    they are an administrator's artifact, so they are found and reported and
+    never edited.
+    """
+    if args.settings:
+        return [SettingsFile("--settings",
+                             os.path.abspath(os.path.expanduser(args.settings)))]
+    home = _claude_home()
+    files = [SettingsFile("user", os.path.join(home, "settings.json")),
+             SettingsFile("user-local", os.path.join(home, "settings.local.json"))]
+    project = _project_dir(args.project)
+    if project:
+        files.append(SettingsFile(
+            "project", os.path.join(project, ".claude", "settings.json")))
+        files.append(SettingsFile(
+            "project-local", os.path.join(project, ".claude", "settings.local.json")))
+    for directory in _policy_dirs():
+        files.append(SettingsFile(
+            "managed", os.path.join(directory, "managed-settings.json"),
+            writable=False))
+        dropin = os.path.join(directory, "managed-settings.d")
+        try:
+            names = sorted(os.listdir(dropin))
+        except Exception:
+            names = []
+        for name in names:
+            if name.endswith(".json") and not name.startswith("."):
+                files.append(SettingsFile("managed", os.path.join(dropin, name),
+                                          writable=False))
+    seen, unique = set(), []
+    for sf in files:
+        key = os.path.normpath(sf.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(sf)
+    return unique
+
+
+def report_file_state(sf):
+    """The one-line inventory row, plus the detail for a file we cannot use."""
+    label = "  %-14s %s" % (sf.scope, sf.path)
+    note = "  (read only -- administrator settings)" if not sf.writable else ""
+    if sf.state == "missing":
+        say(label + c("   not present", "2") + note)
+        return
+    if sf.state == "ok":
+        hooks = sf.data.get("hooks")
+        events = len(hooks) if isinstance(hooks, dict) else 0
+        bits = ["%d hook event(s)" % events]
+        if sf.data.get("statusLine") is not None:
+            bits.append("statusLine")
+        bits.append("%d other key(s)"
+                    % len([k for k in sf.data if k not in ("hooks", "statusLine")]))
+        say(label + c("   " + ", ".join(bits), "2") + note)
+        return
+    say(label + c("   " + sf.state.upper(), "31;1") + note)
+    error = sf.error or {}
+    if sf.state == "unparseable":
+        say("      not valid JSON: %s" % error.get("message"))
+        source = error.get("source")
+        if error.get("empty"):
+            # An empty file is the commonest shape of this and the least
+            # obvious: it is not "settings with nothing in them", it is a syntax
+            # error, and pointing at line 1 column 1 of nothing helps nobody.
+            say("      the file is EMPTY, and an empty file is not valid JSON. The "
+                "smallest")
+            say("      valid settings file is the two characters:  {}")
+        elif error.get("line"):
+            say("      at line %s, column %s:" % (error.get("line"),
+                                                  error.get("column")))
+            if source is not None:
+                say("        %s" % source.rstrip("\n"))
+                column = error.get("column") or 1
+                say("        %s^" % (" " * max(0, column - 1)))
+        say(c("      This file is NOT repairable automatically. Rewriting a file we "
+              "cannot", "33"))
+        say(c("      parse would mean claiming we preserved settings we never read.",
+              "33"))
+        if error.get("empty"):
+            say(c("      Put {} in it, or move it aside:", "33"))
+        else:
+            say(c("      Fix the line above by hand, or move the file aside:", "33"))
+        say("        cp %s %s" % (_quote(sf.path), _quote(next_backup(sf.path))))
+    elif sf.state == "not-an-object":
+        say("      %s" % error.get("message"))
+        say(c("      This file is NOT repairable automatically -- there is nothing "
+              "in it", "33"))
+        say(c("      shaped like settings to repair. Move it aside:", "33"))
+        say("        cp %s %s" % (_quote(sf.path), _quote(next_backup(sf.path))))
+    else:
+        say("      %s" % error.get("message"))
+
+
+def render_finding(finding):
+    marker = {"broken": ("x", "31;1"), "advisory": ("!", "33"), "info": ("\u00b7", "2")}
+    glyph, colour = marker.get(finding.severity, ("x", "31;1"))
+    owner = "OURS" if finding.ours else "another tool"
+    say("  " + c(glyph, colour) + " %s  [%s]  %s" % (finding.where, owner, finding.scope))
+    say("      command: %s" % _clip(finding.command, 88))
+    say("      %s" % finding.detail)
+    say("      fix:     %s" % finding.fix)
+
+
+def main(argv=None):
+    global _QUIET
+    parser = argparse.ArgumentParser(
+        prog="oe-repair",
+        description="Find and remove Claude Code hook/statusLine registrations "
+                    "that point at files which do not exist. This build "
+                    "DIAGNOSES ONLY and never writes.",
+        epilog="Runs by absolute path with nothing installed: "
+               "python3 <checkout>/bin/oe-repair")
+    parser.add_argument("project", nargs="?",
+                        help="the project directory whose .claude/settings.json "
+                             "should be checked (default: the nearest ancestor of "
+                             "the current directory that has one)")
+    parser.add_argument("--yes", action="store_true",
+                        help="ACCEPTED AND REFUSED in this build: it explains "
+                             "why and still writes nothing. See the module "
+                             "docstring.")
+    parser.add_argument("--all", action="store_true",
+                        help="also remove broken entries belonging to other tools. "
+                             "Off by default: silently deleting somebody else's "
+                             "integration is worse than reporting it.")
+    parser.add_argument("--root",
+                        help="the Overwatch Enforcer checkout, for deciding which "
+                             "entries are ours (default: the parent of the "
+                             "directory holding this script)")
+    parser.add_argument("--settings",
+                        help="check exactly this one file and nothing else")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="print the verdict as JSON on stdout and nothing else "
+                             "(diagnostics still go to stderr)")
+    args = parser.parse_args(argv)
+    _QUIET = bool(args.as_json)
+
+    # GUARD ONE OF TWO. write_repair() refuses independently, because a single
+    # guard on a path that can delete a working hook is one edit away from
+    # being gone. Neither guard trusts the other.
+    _refused = bool(args.yes)
+    args.yes = False
+
+    root = args.root or os.environ.get("OE_ROOT") or _default_root()
+    root = os.path.normpath(os.path.abspath(os.path.expanduser(root)))
+    # Does this root look like a checkout at all? When oe-repair has been copied
+    # somewhere else -- or when the tree it lived in was gutted -- nothing can be
+    # attributed to it, and saying so beats an ownership answer nobody can check.
+    root_is_checkout = any(os.path.exists(os.path.join(root, name))
+                           for name in ("install.py", "hooks", "oe", "bin"))
+    project = _project_dir(args.project)
+
+    say()
+    say(c("  oe-repair", "1") + c("  --  Claude Code settings, checked and repaired "
+                                  "from outside Claude Code", "2"))
+    say()
+    say("  install root   %s%s" % (root, "" if root_is_checkout else
+                                   c("   (does not look like a checkout)", "33")))
+    say("  project        %s" % (project or c("none found", "2")))
+    say()
+    say(c("  settings files Claude Code merges:", "2"))
+
+    files = collect_files(args)
+    for sf in files:
+        sf.load()
+        report_file_state(sf)
+        diagnose(sf, root if root_is_checkout else None, project)
+
+    if not root_is_checkout:
+        say()
+        warn("this copy of oe-repair is not inside an Overwatch Enforcer checkout, "
+             "so no")
+        warn("  entry can be attributed to it. Everything below is reported as "
+             "another")
+        warn("  tool's. Pass --root <checkout> to attribute, or --all to act anyway.")
+
+    exit_code = 0
+    findings = [f for sf in files for f in sf.findings]
+    fatal = [sf for sf in files if sf.state in ("unparseable", "unreadable",
+                                                "not-an-object")]
+    broken = [f for f in findings if f.severity == "broken"]
+    advisory = [f for f in findings if f.severity == "advisory"]
+    info = [f for f in findings if f.severity == "info"]
+
+    if findings:
+        say()
+        say(c("  findings:", "2"))
+        for finding in broken + advisory + info:
+            render_finding(finding)
+
+    # What we are allowed to remove, per file. `--all` widens ownership; it does
+    # not widen the KINDS, so an unparseable file stays unrepairable and a
+    # chmod-able script stays reported rather than deleted.
+    targets = {}
+    unrewritable = []
+    for sf in files:
+        chosen = [f for f in sf.findings
+                  if f.removable and (f.ours or args.all)]
+        if chosen and not sf.rewritable:
+            # Diagnosed, printed, and deliberately not repaired. See
+            # _rewrite_blocker(): the alternative is a rewrite this tool cannot
+            # prove Claude Code will still be able to read.
+            unrewritable.append(sf)
+            continue
+        if chosen:
+            targets[id(sf)] = (sf, chosen)
+
+    for sf in unrewritable:
+        say()
+        say(c("  %s  %s" % (sf.scope, sf.path), "1"))
+        say(c("    NOT rewritten: %s" % (sf.rewrite_block or {}).get("message"),
+              "33"))
+        say(c("    The entries above are real and worth fixing; edit this file "
+              "by hand.", "33"))
+        exit_code = 1
+
+    declined = [f for f in findings
+                if f.removable and not f.ours and not args.all]
+    # Broken entries in a managed/policy file. They can be diagnosed and they
+    # cannot be repaired here, and the difference has to be SAID: without this
+    # the report showed two red crosses, planned nothing for them, and left the
+    # reader to wonder why the tool had skipped the only entries it had just
+    # called broken.
+    administrator = [f for f in findings
+                     if not f.writable and f.severity == "broken"]
+
+    repairs = []
+
+    if not targets and not fatal and not broken and not advisory:
+        say()
+        say(c("  nothing wrong. No file was written.", "32"))
+    elif not targets and declined:
+        # NOT the same case as "nothing is repairable", and saying so cost a
+        # user the one sentence that would have kept them looking. `targets` is
+        # empty whenever every removable finding was declined on OWNERSHIP
+        # grounds -- the normal case for a third-party hook, and the guaranteed
+        # case when this script has been copied out of its checkout. The
+        # entries below are removable; they are simply not ours to remove.
+        say()
+        say("  %d broken entr%s found, none of them attributable to this tool."
+            % (len(declined), "y" if len(declined) == 1 else "ies"))
+        say("  They ARE removable -- see the declined block below.")
+    elif not targets and not unrewritable:
+        say()
+        say("  nothing here is automatically repairable. No file was written.")
+
+    for sf, chosen in targets.values():
+        document, changes = plan_repair(sf, chosen)
+        say()
+        say(c("  %s  %s" % (sf.scope, sf.path), "1"))
+        # A plan that changes nothing must not reach the writer: a finding that
+        # claims to be repairable but plans no change would still take a backup,
+        # rewrite the file (reformatting it), and print "repaired" over
+        # something it had not fixed. The planner and the finding disagreeing is
+        # a bug in THIS file, so say so plainly rather than writing anything.
+        if not [line for line in changes if not line.startswith("note:")]:
+            say("    nothing to change here after all -- reported above, not "
+                "repaired.")
+            say("    (a finding claimed to be repairable and planned no change; "
+                "that is a bug in oe-repair)")
+            exit_code = 1
+            continue
+        for change in changes:
+            say("    - " + change)
+        if sf.text and render(sf.data, sf.text) != sf.text:
+            say()
+            warn("this file's exact formatting is not what json.dumps produces. "
+                 "Key order")
+            warn("  and indentation are preserved; comments, trailing commas and "
+                 "blank-line")
+            warn("  grouping are not -- json never saw them. The .bak-N taken "
+                 "before the")
+            warn("  write keeps the original to diff against.")
+        if not args.yes:
+            continue
+        backup, code = write_repair(sf, document, changes)
+        repairs.append({"path": sf.path, "backup": backup,
+                        "changes": changes, "ok": code == 0})
+        if code:
+            exit_code = 1
+        else:
+            for finding in chosen:
+                finding.removed = True
+
+    if administrator:
+        say()
+        say(c("  left alone -- ADMINISTRATOR settings, which this tool never "
+              "edits:", "33"))
+        for finding in administrator:
+            say("    %s in %s" % (finding.where, finding.path))
+        say("    A managed/policy settings file belongs to whoever administers "
+            "this")
+        say("    machine. Send them the lines above; editing it here would be "
+            "undone")
+        say("    by the next policy push anyway.")
+
+    if declined:
+        say()
+        say(c("  left alone -- these belong to another tool:", "33"))
+        for finding in declined:
+            say("    %s in %s" % (finding.where, finding.path))
+        say("    Read the commands above first. Removing them is a manual "
+            "edit in this")
+        say("    build -- delete the entr%s named above from the file%s named "
+            "above." % ("y" if len(declined) == 1 else "ies",
+                        "" if len({f.path for f in declined}) == 1 else "s"))
+
+    if fatal:
+        exit_code = 1
+    if any(f.severity in ("broken", "advisory") and not f.removed for f in findings):
+        exit_code = 1
+
+    if targets:
+        say()
+        say(c("  DIAGNOSE ONLY -- nothing was written.", "1"))
+        say("    Every change above is listed line by line. Apply them by hand:")
+        say("    open the file, remove the entries named, and start Claude Code")
+        say("    again. Take a copy first.")
+    if _refused:
+        say()
+        say(c("  --yes was refused.", "33"))
+        say("    This build does not repair. The repair path can delete a hook")
+        say("    that is WORKING -- it resolves $CLAUDE_PROJECT_DIR and relative")
+        say("    paths against the directory you are standing in, and it reads")
+        say("    `uv run x.py` and `npx tsx x.ts` as a missing script. Removing")
+        say("    a live PreToolUse entry stops every tool call in every session")
+        say("    on this machine, which is worse than the fault above.")
+
+    if exit_code == 0 and repairs:  # unreachable while WRITES_ENABLED is False
+        say()
+        say(c("  repaired. Start Claude Code again.", "32"))
+    say()
+
+    if args.as_json:
+        payload = {
+            "tool": "oe-repair",
+            "schema": VERSION,
+            "root": root,
+            "root_is_checkout": root_is_checkout,
+            "project": project,
+            # `applied` is always false in this build. `writes_enabled`
+            # distinguishes "you did not pass --yes" from "this build cannot
+            # write at all", which a machine reader otherwise cannot tell.
+            "applied": bool(args.yes),
+            "writes_enabled": WRITES_ENABLED,
+            "yes_refused": _refused,
+            "include_other_tools": bool(args.all),
+            "files": [{"scope": sf.scope, "path": sf.path, "state": sf.state,
+                       "writable": sf.writable, "rewritable": sf.rewritable,
+                       "rewrite_block": sf.rewrite_block, "error": sf.error}
+                      for sf in files],
+            "findings": [f.as_dict() for f in findings],
+            "repairs": repairs,
+            "exit": exit_code,
+        }
+        _emit(sys.stdout, json.dumps(payload, indent=2, ensure_ascii=False))
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Interrupted BEFORE any write is the normal case (the report is the
+        # slow part), and os.replace makes an interrupt during the write a
+        # no-op on the original file. Either way, say which.
+        fail("interrupted. Nothing was written by this run unless a 'wrote' line "
+             "appeared above.")
+        sys.exit(130)

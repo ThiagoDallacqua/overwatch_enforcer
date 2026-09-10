@@ -1,0 +1,137 @@
+# Publishing a release. Fires on a version tag and does the three things a tag
+# cannot do by itself: prove the tag agrees with the tree, re-run the checks
+# that decide whether the tree is publishable at all, and attach the bundle
+# `oe package` built -- so the asset a stranger downloads is the leak-scanned
+# one and not a `git archive` nobody looked at.
+#
+# ci.yml does NOT run here: it is scoped to `main` and pull requests, and a tag
+# can point at a commit neither of those ever saw. So the checks are repeated
+# below rather than assumed. Same commands as ci.yml, same commands a
+# maintainer runs locally; CONTRIBUTING.md lists them.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Read at the top. The one job that needs more says so itself, right where the
+# reason is.
+permissions:
+  contents: read
+
+# Never cancel a publish half way through. An interrupted `gh release create`
+# can leave a release sitting there with no asset on it, which is worse than
+# no release at all.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: "publish ${{ github.ref_name }}"
+    runs-on: ubuntu-latest
+    permissions:
+      # The single elevation, and the only thing in this file that writes
+      # anything anywhere: creating the release and uploading one asset to it.
+      # gh reads the automatic per-run token from GH_TOKEN below -- no secret
+      # is configured, stored, or needed.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The FLOOR the README claims, not the newest. A tag can point at a
+          # commit that never went through ci.yml's matrix, and 3.10 is the leg
+          # that catches syntax the tool promises not to need. The newest
+          # interpreter is covered on every push to main.
+          python-version: "3.10"
+
+      # Tagging v1.1.0 while VERSION still says 1.0.0 produces a release whose
+      # own `oe --version` contradicts its name, and a tag cannot be moved once
+      # anyone has fetched it. Stop here instead.
+      - name: the tag and VERSION agree
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if [ ! -f VERSION ]; then
+            echo "::error::VERSION is not in this checkout. It is the source of truth for the release number. If the file exists locally but not here, it is not tracked: .gitignore is an allowlist, so it needs an explicit '!VERSION' line, and oe/package.py needs VERSION in ROOT_FILES."
+            exit 1
+          fi
+          have="$(tr -d '[:space:]' < VERSION)"
+          want="${tag#v}"
+          if [ "$have" != "$want" ]; then
+            echo "::error::tag ${tag} says ${want}, VERSION says ${have}. One of the two is wrong. Fix VERSION and re-tag, or delete the tag -- do not publish a release that disagrees with the tree it was cut from."
+            exit 1
+          fi
+          echo "tag ${tag} agrees with VERSION (${have})"
+
+      # Byte-compilation leaves __pycache__ directories in the tree. Harmless
+      # to everything below: the packager skips any path with __pycache__ in
+      # it, and .gitignore excludes them, so neither the bundle nor the
+      # tracked-file check can see them.
+      - name: every module byte-compiles
+        run: |
+          set -eu
+          python -m compileall -q -f oe hooks install.py extract_pricing.py .github/scripts
+          python -m py_compile bin/oe      # extensionless, so compileall never sees it
+          sh -n bin/oe-watch
+
+      - name: no forbidden file tracked, no PII shape published
+        # The gate with authority in CI. --require-git makes "this is not a
+        # checkout" fatal rather than a vacuous pass. Read the script's
+        # docstring for why this is not simply `oe package`; the step after
+        # this one is the other half of that answer.
+        run: python .github/scripts/leak_gate.py --require-git
+
+      - name: build the asset with the repository's own packager
+        run: |
+          set -eu
+          # `oe package` has two tiers and only one of them means anything on a
+          # hosted runner.
+          #
+          # Tier 2 -- SHAPE -- is machine-independent: a sweep of everything
+          # that ships for home paths, addresses, uuids, branch names and issue
+          # keys. That tier is the one protecting this release, and it means
+          # exactly the same thing here as it does on a laptop.
+          #
+          # Tier 1 -- IDENTITY -- matches the real username, home directory and
+          # account ids of the machine RUNNING it. Here that machine is an
+          # ephemeral VM that has never touched this repository, so tier 1 is
+          # hunting for the identity of something that could not possibly be in
+          # the tree. It is VACUOUS here. Worse than vacuous, left alone: this
+          # runner's own $USER is `runner`, a word the README, oe/redact.py's
+          # generic-username list, CONTRIBUTING.md and this very directory all
+          # legitimately contain, so tier 1 reports eight fatal leaks and no
+          # release is ever publishable.
+          #
+          # So the three variables it reads are pointed at a name that appears
+          # in no file, and tier 1 then passes for the only honest reason there
+          # is: there is nothing here for it to find. It is not evidence about
+          # the author's machine. Tier 1 has authority THERE, which is why
+          # CONTRIBUTING.md makes `oe package` a pre-push step for a human.
+          #
+          # The name is generated, not written above. A literal would sit in
+          # this file, this file ships, and the scan below reads it -- so
+          # writing one down is precisely how it would be found.
+          name="oe$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+          export USER="$name" LOGNAME="$name" HOME="$RUNNER_TEMP/$name"
+          mkdir -p "$HOME"
+
+          # The filename comes from the code -- package.archive_name() -- and
+          # never from a format string repeated here. One definition of what a
+          # release asset is called, so this file cannot drift from it.
+          asset="$RUNNER_TEMP/$(python -c 'from oe import package; print(package.archive_name())')"
+          python bin/oe package --out "$asset"
+          test -s "$asset"
+          echo "OE_ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: create the release and attach the bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" "$OE_ASSET" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

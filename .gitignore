@@ -1,0 +1,122 @@
+# ---------------------------------------------------------------------------
+# This is an ALLOWLIST, and that is deliberate.
+#
+# `oe package` -- the leak gate that builds a shareable bundle -- is an
+# allowlist too, for the reason its own docstring gives: a denylist ships
+# whatever nobody thought to exclude, and the thing nobody thinks to exclude
+# here is `state/`. It holds the account map (a real email address), the
+# session map that undoes every pseudonym in every report, a cost cache full
+# of absolute paths and session titles, and a context database built from
+# whatever source tree this machine works in. Forgetting it once publishes all
+# of that, permanently, to a public repository.
+#
+# So: deny everything, then re-admit exactly what ships. Backups, half-written
+# temp files, bundles, logs, reports, __pycache__ and every file some future
+# command drops in this tree are excluded by construction -- no rule to
+# remember, nothing to keep in sync, and a new leak class cannot appear by
+# somebody forgetting a line.
+#
+# To admit a new file, name it here AND in oe/package.py (ROOT_FILES or
+# TREES). Those two lists disagreeing is itself a finding: `oe package`
+# compares them (see package.drift) and reports the difference.
+#
+# Ordering rule, which is why every directory appears three times: git cannot
+# re-include a file whose parent directory is excluded, so each directory is
+# re-admitted (`!oe/`) before its contents are narrowed (`oe/*` then
+# `!oe/*.py`). This is flat on purpose -- a subdirectory of oe/ or hooks/
+# would need its own trio of lines, which is the moment to ask whether it
+# should ship at all.
+#
+# .gitignore does nothing about a file that is ALREADY tracked, so CI asserts
+# the tracked list separately (.github/scripts/leak_gate.py).
+# ---------------------------------------------------------------------------
+
+*
+
+# --- documentation and repository scaffolding ---
+!.gitignore
+!.gitattributes
+!VERSION
+!LICENSE
+!README.md
+!CONTRIBUTING.md
+!SECURITY.md
+
+# The README is sharded into docs/ so the landing page stays readable. Flat,
+# like oe/ and hooks/: a subdirectory here would need its own trio of lines,
+# which is the moment to ask whether it should ship at all.
+!docs/
+docs/*
+!docs/*.md
+
+# --- the tool ---
+!install.py
+!extract_pricing.py
+!config.example.json
+
+!oe/
+oe/*
+!oe/*.py
+
+!hooks/
+hooks/*
+!hooks/*.py
+
+# bin/oe, bin/oe-watch and bin/oe-repair are extensionless on purpose. They are
+# named one by one rather than admitted as `bin/*`, so bin/oe.bak or bin/oe.tmp
+# cannot ride along on the same rule.
+#
+# oe-repair is the rescue script, and it is the one file here that MUST ship: it
+# is what a user runs when a hook entry points at a script that is gone and
+# Claude Code cannot make a single tool call. oe/package.py admits it already
+# (TREES["bin"] is None, i.e. any extensionless file), so leaving it out of this
+# list would have put it in exactly the state package.drift calls out -- shipped
+# in a bundle, absent from a clone -- and the rescue path would be missing on
+# precisely the machines that install by `git clone`.
+!bin/
+bin/*
+!bin/oe
+!bin/oe-watch
+!bin/oe-repair
+
+# --- continuous integration ---
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/*.yml
+!.github/scripts/
+.github/scripts/*
+!.github/scripts/*.py
+
+# ---------------------------------------------------------------------------
+# Belt and braces. The `*` above already excludes every one of these; they are
+# repeated here, LAST, because the last matching rule wins -- so a future
+# `!*.json` or `!oe/**` cannot quietly re-admit them.
+#
+# config.json is machine-local twice over: it carries this machine's
+# reports_root, and `oe guard mode ...` rewrites it at runtime. A tracked copy
+# would publish a local path AND make the documented `git pull` update fail on
+# a dirty tree. Copy config.example.json if you want to tune something; with
+# no config.json at all the code defaults apply, which is the supported
+# zero-config case.
+# ---------------------------------------------------------------------------
+state/
+reports/
+config.json
+__pycache__/
+*.py[cod]
+*.bak
+*.bak-*
+*.tmp
+*.orig
+*.rej
+*.log
+*.tar.gz
+*.tar.gz.part
+replaced-statusline*.json
+settings-baseline*.json
+.venv/
+venv/
+.DS_Store
+.claude/

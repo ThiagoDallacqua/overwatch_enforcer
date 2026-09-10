@@ -1,0 +1,27 @@
+#!/bin/sh
+# oe-watch -- the whole product in one word.
+#
+# Run this in a pane next to Claude Code. It needs no arguments, no settings.json
+# key, no hooks and no install step: it reads the transcripts Claude Code is
+# already writing under ~/.claude/projects/ and starts the background supervisor
+# that keeps each session's report.html up to date.
+#
+#   oe-watch              live view, refreshes every 2s
+#   oe-watch --interval 5 slower redraw
+#   oe-watch --once       one frame, then exit
+#   oe-watch --keys       open with the legend showing
+#
+# Every other subcommand lives on `oe` itself; this shim only exists so the
+# common case is one short word. Arguments are passed straight through.
+# The install root is resolved from THIS script rather than written in: a
+# literal path is correct on one machine and wrong on every other, and this
+# shim is the first thing a new person runs. `command -v` handles being
+# invoked through a PATH symlink; the fallback is the plain dirname.
+# python3 does the resolving rather than `readlink -f`, which is a GNU flag that
+# macOS's readlink does not have -- and python3 is already a hard requirement of
+# the next line, so this costs nothing extra. realpath() follows a symlink on
+# PATH all the way back to the real tree.
+self=$0
+case $self in */*) ;; *) self=$(command -v -- "$self" 2>/dev/null || echo "$self") ;; esac
+dir=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.realpath(sys.argv[1])))' "$self") || exit 1
+exec python3 "$dir/oe" watch "$@"

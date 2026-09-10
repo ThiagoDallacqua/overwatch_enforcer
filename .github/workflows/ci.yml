@@ -1,0 +1,86 @@
+# Continuous integration for a stdlib-only tool: no install step, no cache, no
+# third-party action beyond checkout and setup-python. Every step here is a
+# command a contributor can run locally, which is the point -- CONTRIBUTING.md
+# lists the same four.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Syntax on the oldest and newest interpreters the README claims, on both
+  # supported platforms. macOS runs one leg rather than two: it is there to
+  # catch a platform-conditional import, not to re-test the language.
+  compile:
+    name: "compile (${{ matrix.os }}, py${{ matrix.python }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: every module byte-compiles
+        run: python -m compileall -q -f oe hooks install.py extract_pricing.py .github/scripts
+      # bin/oe is extensionless on purpose, so compileall never sees it.
+      - name: the entry point byte-compiles
+        run: python -m py_compile bin/oe
+      - name: the sh shim parses
+        run: sh -n bin/oe-watch
+
+  # The checklist subsumes an import smoke test: it reports "modules import
+  # N/N" and fails if any module does not.
+  checklist:
+    name: dependency checklist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # --allow-missing-claude is REQUIRED. Without it the checklist fails on
+      # "Claude Code / installed" and exits 1 on every runner, since no runner
+      # has Claude Code. --no-binary-probe skips a whole-binary read of a file that
+      # is not there anyway.
+      - name: checklist passes with no Claude Code present
+        run: python install.py --check --allow-missing-claude --no-binary-probe
+      # --check documents itself as "the checklist only. Nothing was written."
+      # This asserts that against the one file it would otherwise rewrite,
+      # config.json -- which is untracked precisely so `git pull` keeps working.
+      - name: "--check modified no tracked file"
+        run: 'test -z "$(git status --porcelain)" || { git status --porcelain; exit 1; }'
+
+  # Two checks: nothing forbidden is tracked, and nothing published carries a
+  # PII-shaped string. Read the script's docstring for why this is not simply
+  # `oe package` -- the short version is that `oe package`'s identity tier
+  # matches the running machine's own username, and on a runner that username
+  # is `runner`, a word this repository legitimately contains.
+  leak-gate:
+    name: leak gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: no forbidden file tracked, no PII shape published
+        run: python .github/scripts/leak_gate.py --require-git

@@ -1,0 +1,21 @@
+# Normalise to LF in the repository, and check LF out everywhere.
+#
+# bin/oe and bin/oe-watch are extensionless scripts whose first line is a
+# shebang. A clone with core.autocrlf=true rewrites it to '#!/bin/sh\r', the
+# shell reports 'bad interpreter', and the user sees 'oe: not found' with
+# nothing pointing at the cause. Every file here is text, so the blanket rule
+# is both correct and sufficient.
+* text=auto eol=lf
+
+# Belt and braces for the two entry points, so no heuristic can reclassify them.
+bin/oe        text eol=lf
+bin/oe-watch  text eol=lf
+
+# Keep CI out of `git archive` / release tarballs. `oe package` is the
+# supported bundle format and it has its own allowlist.
+.github/       export-ignore
+.gitattributes export-ignore
+.gitignore     export-ignore
+
+# The README is long enough to dominate GitHub's language stats otherwise.
+README.md linguist-documentation
