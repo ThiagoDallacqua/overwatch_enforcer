@@ -288,6 +288,14 @@ class ToolCall:
     content_bytes: int = 0
     span_lo: Optional[int] = None   # Read offset (1-based), when the call gave one
     span_hi: Optional[int] = None   # last line requested, when offset+limit gave one
+    # What the RESULT said, which is fact rather than request. None when the
+    # transcript carried no file block for this call -- an older transcript, a
+    # non-Read reader, or an error. Never inferred from the absence of an
+    # offset: "no offset" and "we do not know" are different states and only
+    # one of them may be called a whole-file read.
+    result_lo: Optional[int] = None
+    result_lines: Optional[int] = None
+    file_lines: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         row = asdict(self)
@@ -352,6 +360,39 @@ def _read_span(tool_input: Any) -> Tuple[Optional[int], Optional[int]]:
         return (None, None)
     lo = max(1, lo or 1)
     return (lo, (lo + count - 1) if count else None)
+
+
+def _span_part(span: Any, index: int) -> Optional[int]:
+    """One member of a (start, lines, total) triple, or None if there is none."""
+    if not isinstance(span, tuple) or len(span) != 3:
+        return None
+    return int(span[index])
+
+
+def _result_file_span(obj: dict) -> Optional[Tuple[int, int, int]]:
+    """(startLine, numLines, totalLines) as Claude Code recorded them, or None.
+
+    A Read's own arguments are a REQUEST, not a result: `offset` with no `limit`
+    says where to begin and nothing about where it stopped, and a file shorter
+    than the cap returns fewer lines than asked for. `toolUseResult.file`
+    carries what actually landed, which is the only way to tell a whole-file
+    read from a partial one without guessing.
+    """
+    result = obj.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    info = result.get("file")
+    if not isinstance(info, dict):
+        return None
+    try:
+        start = int(info.get("startLine"))
+        count = int(info.get("numLines"))
+        total = int(info.get("totalLines"))
+    except (TypeError, ValueError):
+        return None
+    if start < 1 or count < 0 or total < 0:
+        return None
+    return start, count, total
 
 
 def _result_content_bytes(obj: dict, tool_use_id: str) -> int:
@@ -1468,9 +1509,25 @@ class SessionLedger:
             tokens = content / 4.0
             carried = _requests_after(windows.get(window) or [], stamp,
                                       marks if window == "main" else None)
+            # Three states, never two. "the call passed no offset" is a REQUEST
+            # shape and says nothing about what came back; only the result's own
+            # file block can settle whole-file, and 1 read in 5 has none.
+            if tool.result_lines is not None and tool.file_lines is not None:
+                span_source = "exact"
+                whole_file = (tool.result_lo == 1
+                              and tool.result_lines >= tool.file_lines)
+            elif tool.span_lo is not None:
+                span_source = "input"
+                whole_file = None
+            else:
+                span_source = "unknown"
+                whole_file = None
             events.append({
                 "path": path,
                 "ts": _iso(stamp),
+                "span_source": span_source,
+                "whole_file": whole_file,
+                "file_lines": tool.file_lines,
                 "window": window,
                 "generation": generation,
                 "turn_index": tool.turn_index,
@@ -2366,6 +2423,7 @@ class _Loader:
                     if obj is not None:
                         entry["content_bytes"] = _result_content_bytes(obj, tool_use_id)
                         entry["ts"] = _parse_ts(obj.get("timestamp"))
+                        entry["file_span"] = _result_file_span(obj)
                 self.tool_results[tool_use_id] = entry
             prompt = _PROMPT_ID_RE.search(raw)
             return prompt.group(1) if prompt else current_prompt
@@ -2391,6 +2449,7 @@ class _Loader:
                         if tool_use_id in self.read_ids:
                             entry["content_bytes"] = _result_content_bytes(
                                 obj, tool_use_id)
+                            entry["file_span"] = _result_file_span(obj)
                         self.tool_results[tool_use_id] = entry
                         del payload
             has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result"
@@ -2631,6 +2690,9 @@ class _Loader:
                     content_bytes=_int(result.get("content_bytes")),
                     span_lo=span[0],
                     span_hi=span[1],
+                    result_lo=_span_part(result.get("file_span"), 0),
+                    result_lines=_span_part(result.get("file_span"), 1),
+                    file_lines=_span_part(result.get("file_span"), 2),
                 ))
         tools.sort(key=lambda t: (t.ts or datetime.min.replace(tzinfo=timezone.utc)))
         self.ledger.tools = tools

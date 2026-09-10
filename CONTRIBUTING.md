@@ -16,7 +16,7 @@ below are the ones you could not guess from the source.
 - `state/` — the account map (a real address), the session map that undoes
   every pseudonym in every report, a cost cache full of absolute paths and
   session titles, and a context database built from your own source trees.
-- `config.json` — machine-local, and rewritten at runtime by `oe guard mode`.
+- `config.json` — machine-local, and rewritten at runtime.
   A tracked copy would publish a local path and break `git pull` on a dirty
   tree. Copy `config.example.json` if you want to tune something.
 - `reports/`, `__pycache__/`, `*.pyc`, `*.bak`, `*.tmp`, `*.log`, `*.tar.gz`.

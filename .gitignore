@@ -84,6 +84,7 @@ oe/*
 !oe/redact.py
 !oe/report.py
 !oe/retrieval.py
+!oe/shrink.py
 !oe/statusline.py
 !oe/store.py
 !oe/version.py

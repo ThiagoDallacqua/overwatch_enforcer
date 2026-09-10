@@ -162,6 +162,46 @@ Rows sharing a group monetise the same tokens, so the total is deliberately **no
 the rows: `levers not yet taken` counts the largest row in each group once. The `do:` text is
 clipped to the terminal width; widen the terminal to read it in full.
 
+### `oe shrink [session|--all]`
+
+Every file read, re-priced against what this machine's index could have printed instead.
+`--all` merges every transcript, `--limit N` sets how many file rows print, `--measured`
+prices from the session's own request stream instead of the corpus-calibrated rate, and
+`--json` gives the redacted shape with paths replaced by the same tokens `oe rereads` uses,
+so the two join.
+
+```
+$ oe shrink --all
+```
+
+Reads are sorted onto rungs, first match wins:
+
+| rung | what it means | the alternative |
+|---|---|---|
+| whole file, has outline | the whole file entered context, and the index has a symbol table for it | the outline — `oe slice <path>` with no target |
+| spanned, has outline | the read already named a line range | the covering chunks, which are **coarser** than the range and therefore cost more |
+| span unknown | neither the result nor the call recorded a span | none; counted, never classified |
+| indexed, no outline | indexed, but no symbols were found in it | none |
+| never indexed | `oe` has not indexed that file type, or that root | none |
+
+**The band is not a saving.** Which symbol a reader wanted is recorded nowhere, so the low
+end is zero by construction: the tool cannot know that an outline would have answered the
+question a read was asking, and will not assume it. The high end is what those reads cost
+minus what their outlines cost — the far end of an interval, not a forecast. Every alternative
+price is produced by rendering the command you would have run and counting what it printed;
+there is no ratio and no constant.
+
+The spanned rung is reported on its own line as a **loss**, never netted into the band. A read
+that already names a range is finer-grained than the index's chunks, so pricing it against them
+costs more, not less. Hiding that inside a net figure would flatter the tool.
+
+Three limits it states on screen. Reads are priced against the index **as it stands now** —
+files that changed or were deleted since they were indexed are excluded, with their counts
+shown, because the counterfactual does not hold for them. Only `Read` is counted, so
+`cat`/`sed`/`head` through `Bash` are invisible. And most reads happen in agent windows, which
+`oe` cannot inject into: it registers `SessionStart` and `UserPromptSubmit`, both main-loop.
+This is a command you run, not advice the tool can deliver.
+
 ## Retrieval
 
 These four commands exist so an agent can be handed a slice instead of a file path. They read

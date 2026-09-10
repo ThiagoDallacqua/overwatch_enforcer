@@ -65,8 +65,8 @@ written) and **warn** is informational.
 the one subprocess it spawns, so a fresh clone is byte-for-byte identical afterwards, not
 even a `__pycache__`. The same is true of a plain dry run. CI asserts it.
 
-The tail, captured from a throwaway fixture install (see
-[How these blocks were captured](commands.md#how-these-blocks-were-captured)):
+The tail of a run, shown for shape rather than as a transcript of yours — the paths and the
+count depend on the machine (see [About the examples](commands.md#about-the-examples)):
 
 ```
 $ python3 install.py --check | tail -n 8

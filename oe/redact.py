@@ -52,7 +52,7 @@ __all__ = [
     "REDACTION_VERSION", "RedactionError", "Finding", "Redactor",
     "audit", "audit_file", "blocking", "ensure_redacted", "redact_payload",
     "redact_scan_row", "redact_scan_rows", "redact_row_json", "redact_call",
-    "redact_rereads", "target_label", "shape_of", "map_path",
+    "redact_rereads", "redact_shrink", "target_label", "shape_of", "map_path",
     "record_local", "whois",
     "reverse_lookup", "local_session_info", "session_pseudonym",
     "project_pseudonym",
@@ -1342,6 +1342,48 @@ def _redact_tool(tool: Dict[str, Any], red: Redactor) -> Dict[str, Any]:
     out["turn"] = red.turn(tool.get("prompt_id"))
     out["agent"] = red.agent(tool.get("agent_id"))
     out["target"] = red.target(tool.get("name"), tool.get("target"))
+    return out
+
+
+_SHRINK_TOTALS_FIELDS: Tuple[str, ...] = (
+    "money", "scope", "band_lo_usd", "band_hi_usd", "dearer_usd",
+    "outline_ratio_median", "outline_beat", "outline_lost", "file_count",
+)
+
+_SHRINK_RUNG_FIELDS: Tuple[str, ...] = (
+    "rung", "calls", "tokens", "usd", "alt_tokens", "band_hi_usd", "dearer_usd",
+)
+
+_SHRINK_FILE_FIELDS: Tuple[str, ...] = (
+    "calls", "tokens", "usd", "band_hi_usd", "whole", "beat", "symbols",
+    "outline_tokens",
+)
+
+_SHRINK_COUNT_FIELDS: Tuple[str, ...] = ("why", "reason", "calls", "usd")
+
+
+def redact_shrink(block: Any, red: Redactor) -> Dict[str, Any]:
+    """The read-shrink block, projected. Paths become shape tokens.
+
+    Same Redactor as redact_rereads(), and Redactor.target() memoises on the raw
+    value, so a file that appears in both tables carries the same token in both
+    and the two still join.
+    """
+    if not isinstance(block, dict):
+        return {}
+    out = _pick(block, _SHRINK_TOTALS_FIELDS)
+    out["totals"] = _pick(block.get("totals"),
+                          ("calls", "tokens", "usd", "sidechain_calls"))
+    out["span_source"] = _pick(block.get("span_source"), ("exact", "input", "unknown"))
+    out["rungs"] = [_pick(row, _SHRINK_RUNG_FIELDS)
+                    for row in (block.get("rungs") or []) if isinstance(row, dict)]
+    out["unreachable"] = [_pick(row, _SHRINK_COUNT_FIELDS)
+                          for row in (block.get("unreachable") or []) if isinstance(row, dict)]
+    out["excluded"] = [_pick(row, _SHRINK_COUNT_FIELDS)
+                       for row in (block.get("excluded") or []) if isinstance(row, dict)]
+    out["files"] = [
+        dict(_pick(row, _SHRINK_FILE_FIELDS), target=red.target("Read", row.get("path")))
+        for row in (block.get("files") or []) if isinstance(row, dict)]
     return out
 
 

@@ -80,6 +80,7 @@ READ_ONLY = (
     ("audit", ["audit"]),
     ("savings", ["savings"]),
     ("rereads", ["rereads"]),
+    ("shrink", ["shrink", "--limit", "3"]),
     ("find", ["find", "atomic_write"]),
     ("deps", ["deps", "oe/paths.py"]),
     ("slice", ["slice", "oe/paths.py", "atomic_write"]),
