@@ -1,7 +1,8 @@
 # Security
 
-Overwatch Enforcer registers hooks that Claude Code executes around every tool
-call, `install.py` is the only component permitted to write Claude Code's
+Overwatch Enforcer registers three hooks that Claude Code executes — at session
+start, on each prompt, and at session end. None of them runs on a tool call.
+`install.py` is the only component permitted to write Claude Code's
 `settings.json`, and the redaction layer is the only thing keeping a shared
 report from carrying a real address. A bug in any of those three is a security
 bug, not a defect report.

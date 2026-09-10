@@ -67,7 +67,7 @@ If Claude Code stops with a hook error, repair it from a plain shell:
 It **diagnoses only** in v1.0.0 and never writes: it prints the entries that
 point at nothing, quoted line by line, and you remove them by hand. The repair
 path is held back one release because it can delete a registration that is
-working — see [Operations](docs/operations.md#repairing-settingsjson).
+working — see [A hook entry points at a file that is gone](docs/operations.md#a-hook-entry-points-at-a-file-that-is-gone).
 
 `oe repair` runs the same tool. It imports nothing from `oe/`, so it still
 works when the rest of the checkout does not — which is the state it is for.
@@ -78,7 +78,8 @@ Its output is deliberately NOT redacted: read it before pasting it anywhere.
 **Measurement — zero configuration.** Nothing is installed and nothing is registered.
 Everything is derived from `~/.claude/projects/**/*.jsonl`, which Claude Code writes whether
 or not this tool exists. `oe status`, `oe watch`, `oe sessions`, `oe report`, `oe rereads`,
-`oe savings`, `oe audit` and the retrieval commands all work on a fresh clone with no setup.
+`oe shrink`, `oe savings`, `oe audit` and the retrieval commands all work on a fresh clone
+with no setup.
 
 **Hooks and the status line — opt-in, registered by `install.py`.** Three hook entries:
 
@@ -94,6 +95,23 @@ this tool can never block a Claude Code session.
 Without the hooks the meter still works. What they add is a report directory and start/end
 metadata written at the right moments, a watcher started without you asking, and the budget
 line. Every number comes from the transcripts either way.
+
+## What a read cost, against what it could have cost
+
+`oe shrink` re-prices every file read in your transcripts against what this machine's own
+index could have printed instead, and sorts the reads onto rungs: whole-file reads of files
+that have a symbol table, reads that already named a line range, reads of files the index
+never saw. For the first rung it renders `oe slice <path>` for real and counts the tokens,
+so the alternative price is measured on your files rather than taken from a ratio.
+
+It never reports a saving. Which symbol a reader wanted is not recorded anywhere, so the
+result is an interval whose low end is zero — `oe` cannot know that an outline would have
+answered the question, and does not assume it. Reads it cannot classify are counted and
+labelled, never guessed at, and the rung where the index would have printed *more* than the
+read is shown as a loss on its own line rather than netted away.
+
+See [Command reference](docs/commands.md#oe-shrink-session--all) for the rungs and the
+contract, and [Retrieval](docs/commands.md#retrieval) for the commands it prices against.
 
 ## You never start oe
 
@@ -114,7 +132,7 @@ command computes its own answer from the transcripts.
 | document | what is in it |
 |---|---|
 | [Install](docs/install.md) | Requirements, `--check`, backing up your settings file, the dry run, local vs user scope, exactly what gets written, updating, uninstalling, pinning a version, shells and platforms, and the `oe: command not found` runbook. |
-| [Command reference](docs/commands.md) | Every command, with output captured from a throwaway fixture. |
+| [Command reference](docs/commands.md) | Every command and what it is for. Each entry shows how to invoke it, not what it prints — see [About the examples](docs/commands.md#about-the-examples) for why. |
 | [Privacy](docs/privacy.md) | What is redacted, where, and what is not. Read it before a screenshot goes into a ticket. |
 | [Configuration](docs/configuration.md) | Every `config.json` key and every environment variable, and why nothing here is tied to a machine or a person. |
 | [Limits, troubleshooting and layout](docs/operations.md) | The known limits stated plainly, the troubleshooting runbook, what the tool writes and where, and how the repository and CI work. |

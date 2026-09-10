@@ -129,7 +129,7 @@ TREES: Dict[str, Optional[frozenset]] = {
         "pricing.py",
         "redact.py",
         "report.py",
-        "retrieval.py",
+        "retrieval.py", "shrink.py",
         "statusline.py",
         "store.py",
         "version.py",

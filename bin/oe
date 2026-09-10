@@ -3658,6 +3658,74 @@ _REASON_LABEL = {
 }
 
 
+
+def cmd_shrink(args) -> int:
+    """What each read cost, against what this machine's index could have printed."""
+    shrink_mod = _lazy("shrink")
+    if shrink_mod is None:
+        # _lazy() swallows the ImportError, so without this the command would
+        # simply print nothing and exit 0 -- indistinguishable from "no reads".
+        print("oe shrink needs oe/shrink.py, which this install does not have.",
+              file=sys.stderr)
+        return 2
+
+    events: List[Dict[str, Any]] = []
+    if getattr(args, "all", False):
+        count = 0
+        for transcript in paths.iter_transcripts():
+            try:
+                events.extend(ledger_mod.load(transcript).reread_events())
+            except Exception:
+                continue
+            count += 1
+        label = f"{count} transcripts"
+    else:
+        transcript = resolve_transcript(getattr(args, "session", None))
+        if transcript is None:
+            return 1
+        led = ledger_mod.load(transcript)
+        events = led.reread_events()
+        label = short_sid(led.session_id)
+    if not events:
+        print("no file reads found for that selector")
+        return 1
+
+    res = shrink_mod.analyse(events, measured=bool(getattr(args, "measured", False)),
+                             limit=int(getattr(args, "limit", 12) or 12))
+    res["scope"] = label
+    if getattr(args, "json", False):
+        # redact_shrink takes a Redactor so its path tokens match the ones
+        # redact_rereads mints for the same file; _emit_json passes only the
+        # payload, so the Redactor is bound here.
+        print(json.dumps(
+            _emit_json(res, lambda block: redact_mod.redact_shrink(
+                block, redact_mod.Redactor())),
+            indent=2, default=str))
+        return 0
+
+    width, _h = term_size()
+    width = min(width, 100)
+    base = retrieval_base()
+    print()
+    print(shrink_mod.render(
+        res, width=width, money=money,
+        # clip_left, never clip: it scrubs BEFORE trimming, and every path rule
+        # is anchored on the left. See its docstring for the leak this avoids.
+        shorten=lambda path: clip_left(path, max(24, width - 40)),
+        rule=lambda w, text="": rule(w, f" {text}  {label} "),
+        dim=lambda text: c(text, DIM)))
+    print()
+    return 0
+
+
+def retrieval_base() -> str:
+    ret = _lazy("retrieval")
+    try:
+        return ret.path_base() if ret else ""
+    except Exception:
+        return ""
+
+
 def cmd_rereads(args) -> int:
     block, label = _reread_scope(args)
     if not block or not block.get("reads"):
@@ -4487,7 +4555,7 @@ def build_parser() -> argparse.ArgumentParser:
                       "than N days, then VACUUM (dry run unless --yes)")
     prune.add_argument("--days", type=int, default=45,
                        help="retention window in days (default: 45). Events are the "
-                            "evidence `oe guard replay` and `oe savings` read, so keep "
+                            "evidence `oe savings` reads, so keep "
                             "this wider than the period you want to measure.")
     prune.add_argument("--yes", action="store_true",
                        help="actually delete. Without it this only counts.")
@@ -4548,6 +4616,19 @@ def build_parser() -> argparse.ArgumentParser:
                               "the corpus-calibrated rate")
     rereads.add_argument("--json", action="store_true")
     rereads.set_defaults(func=cmd_rereads)
+
+    shrink = sub.add_parser(
+        "shrink", help="what each read cost against what the index could have printed")
+    shrink.add_argument("session", nargs="?",
+                        help="session id, id prefix, path, or --last (default)")
+    shrink.add_argument("--last", dest="session", action="store_const", const="--last")
+    shrink.add_argument("--all", action="store_true", help="every transcript")
+    shrink.add_argument("--limit", type=int, default=12, help="file rows to print")
+    shrink.add_argument("--measured", action="store_true",
+                        help="price from this session's own request stream instead of "
+                             "the corpus-calibrated rate")
+    shrink.add_argument("--json", action="store_true")
+    shrink.set_defaults(func=cmd_shrink)
 
     savings = sub.add_parser(
         "savings", help="every lever, measured on your data, ranked by dollars")
