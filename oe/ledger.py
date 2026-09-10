@@ -79,6 +79,11 @@ _RUN_START_GRACE = timedelta(seconds=120)
 # itself on the covered side of a "strictly before" scan.
 _RIGHT_EDGE_EPS = 0.001
 
+# How far the context window must fall in one step to count as emptied rather
+# than merely smaller. See the comment in context_growth() for why this is not
+# a calibrated figure.
+_RESET_FRACTION = 0.25
+
 # The six priced components of one request, in the order the report prints them.
 _COST_KEYS = ("input_usd", "output_usd", "cache_write_5m_usd",
               "cache_write_1h_usd", "cache_read_usd", "web_search_usd")
@@ -856,6 +861,15 @@ class SessionLedger:
                 "cache_read_tokens": 0, "cache_write_tokens": 0,
                 "cost": 0.0, "tools": 0, "subagent_calls": 0, "duration_s": 0.0,
                 "context_end_tokens": 0,
+                # Per-kind USD travels with every other breakdown row (by_model,
+                # by_origin); by_turn is the one that never got it, which is why
+                # the console could show WHAT a turn cost but not WHICH KIND of
+                # token it went on. main_cache_read_usd is separate because a
+                # turn's blended cache_read_usd includes every agent window
+                # spawned inside it -- a fan-out turn would otherwise read as
+                # the user's own window growing.
+                **{key: 0.0 for key in _COST_KEYS},
+                "main_cache_read_usd": 0.0,
             })
         orphan = {
             "prompt_id": None, "index": -1, "first_ts": None,
@@ -864,6 +878,8 @@ class SessionLedger:
             "cache_read_tokens": 0, "cache_write_tokens": 0,
             "cost": 0.0, "tools": 0, "subagent_calls": 0, "duration_s": 0.0,
             "context_end_tokens": 0,
+            **{key: 0.0 for key in _COST_KEYS},
+            "main_cache_read_usd": 0.0,
         }
         for call in self.calls:
             position = index_of.get(call.turn_index)
@@ -876,10 +892,17 @@ class SessionLedger:
             row["cache_write_tokens"] += call.cache_write_5m + call.cache_write_1h
             row["cost"] += call.total_usd
             row["tools"] += len(call.tools)
+            for key in _COST_KEYS:
+                row[key] += float(call.cost.get(key, 0.0) or 0.0)
             if call.origin != "main":
                 row["subagent_calls"] += 1
-            elif call.context_tokens:
-                row["context_end_tokens"] = call.context_tokens
+            else:
+                row["main_cache_read_usd"] += float(
+                    call.cost.get("cache_read_usd", 0.0) or 0.0)
+                # Still guarded: a main call that carries no context figure must
+                # not overwrite the one the turn already has.
+                if call.context_tokens:
+                    row["context_end_tokens"] = call.context_tokens
         for position, turn in enumerate(self.turns):
             start = turn.ts
             end = (self.turns[position + 1].ts if position + 1 < len(self.turns)
@@ -1496,7 +1519,8 @@ class SessionLedger:
         if not series:
             return {"tokens_per_turn": 0.0, "turns_until_full": None, "current_tokens": 0,
                     "max_tokens": pricing.DEFAULT_CONTEXT_WINDOW, "headroom_tokens": 0,
-                    "resets": 0, "samples": 0, "per_call_tokens": 0.0}
+                    "resets": 0, "major_resets": 0, "samples": 0,
+                    "per_call_tokens": 0.0}
         current = series[-1]["context_tokens"]
         window = series[-1]["max_tokens"]
         headroom = max(0, window - current)
@@ -1514,6 +1538,19 @@ class SessionLedger:
         steps = [b - a for a, b in zip(ordered, ordered[1:])]
         rises = sorted(step for step in steps if step > 0)
         resets = sum(1 for step in steps if step < 0)
+        # `resets` counts EVERY backward step, and a window shrinks slightly for
+        # reasons that are not a compaction. Dividing a session's re-read bill by
+        # that count therefore divides by too much. `major_resets` counts only
+        # the falls that actually emptied the window.
+        #
+        # _RESET_FRACTION is a separator, not a calibration. Real compactions and
+        # ordinary shrinkage do not occupy the same range -- they sit either side
+        # of a wide empty band, and every threshold across that band returns the
+        # same count on the sessions this was checked against. It is here to name
+        # the gap, not to tune a number, which is why nothing downstream exposes
+        # it as a setting.
+        major_resets = sum(1 for before, after in zip(ordered, ordered[1:])
+                           if before > 0 and (after - before) / before < -_RESET_FRACTION)
         if rises:
             middle = len(rises) // 2
             per_turn = (rises[middle] if len(rises) % 2
@@ -1527,6 +1564,7 @@ class SessionLedger:
 
         return {
             "tokens_per_turn": round(per_turn, 1),
+            "major_resets": major_resets,
             "per_call_tokens": round(per_call, 1),
             "turns_until_full": (int(headroom / per_turn) if per_turn > 0 else None),
             "current_tokens": current,

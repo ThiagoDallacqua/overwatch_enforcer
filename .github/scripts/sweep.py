@@ -109,6 +109,9 @@ BLIND_SPOTS = (
     "a file that BOTH the bundle allowlist and git miss. drift() compares the "
     "two against each other; a file in neither is invisible to both.",
     "whether a command that was only --help-checked actually works.",
+    "a field dropped by a redaction allowlist other than _TURN_FIELDS. Only "
+    "by_turn is asserted, on `oe status --last --json`; every other block's "
+    "field list can lose a name and nothing here will say so.",
 )
 
 
@@ -294,6 +297,8 @@ def tier_surface(sweep: Sweep, scratch: Path) -> None:
             failed += 1
             sweep.finding("surface", "fatal", f"oe {label}",
                           f"exit {proc.returncode}")
+        elif label == "status --last":
+            failed += _check_turn_fields(sweep, label, proc.stdout)
     covered = {argv[0] for _label, argv in READ_ONLY}
     listed = _subcommands()
     only_help = sorted(listed - covered)
@@ -313,6 +318,43 @@ def tier_surface(sweep: Sweep, scratch: Path) -> None:
     sweep.result("surface", failed == 0,
                  f"{ran} run for real, {len(only_help)} --help only, "
                  f"{failed} failed")
+
+
+
+# Every per-turn figure has to cross oe/redact.py's _TURN_FIELDS allowlist, which
+# rebuilds each row from an explicit list of names and drops the rest without a
+# word. Worse, the projector only runs when stdout is NOT a terminal, so a field
+# missing from that list is present while you develop and gone the moment anything
+# reads it -- a pipe, report.html, `oe savings`. Nothing else in this repo can see
+# that happen: the canary suite plants LEAKS, which is the opposite direction.
+#
+# This runs on the redacted payload, because subprocess captures stdout.
+_TURN_KEYS_REQUIRED = ("cache_read_tokens", "cache_read_usd", "main_cache_read_usd")
+
+
+def _check_turn_fields(sweep: Sweep, label: str, stdout: str) -> int:
+    try:
+        payload = json.loads(stdout)
+    except ValueError as exc:
+        sweep.finding("surface", "fatal", f"oe {label}",
+                      f"--json did not parse: {exc}")
+        return 1
+    rows = [row for row in (payload.get("by_turn") or [])
+            if isinstance(row, dict) and row.get("calls")]
+    if not rows:
+        sweep.notes.append(
+            f"`oe {label}` returned no populated by_turn rows, so the per-turn "
+            f"allowlist could not be checked on this machine.")
+        return 0
+    missing = sorted({name for name in _TURN_KEYS_REQUIRED
+                      for row in rows if name not in row})
+    if missing:
+        sweep.finding("surface", "fatal", f"oe {label}",
+                      f"by_turn rows reach a redacted payload without "
+                      f"{', '.join(missing)} -- add the name(s) to _TURN_FIELDS "
+                      f"in oe/redact.py; _pick() drops what it is not told about")
+        return 1
+    return 0
 
 
 def _subcommands():
