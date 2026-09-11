@@ -100,7 +100,8 @@ line up.)
   footer leads with its scope — `N of M sessions shown, most recent first` — and its totals
   cover the rows shown, not everything on disk.
 * **The scan cap.** Every command that lists or totals sessions — `oe sessions`,
-  `oe account`, the all-time figure in `oe status` and `oe watch`, and the dashboard — reads
+  `oe account` and `oe status --all-accounts`, the all-time figure in `oe watch`, and the
+  dashboard — reads
   at most the newest `scan.max_sessions` transcripts (500 by default). Older sessions are not
   counted anywhere, and each of those screens says so when it happens: `covers the newest 500
   of M sessions`. Raise the cap in `config.json` to include them. Each extra session is
@@ -393,6 +394,10 @@ so it is marked with a `?` — and `unknown` means nothing on disk names an acco
 **On a new install, `unknown` is mostly history.** A session can only be stamped while it is
 running, so every session that finished before the tool was installed stays `unknown` unless
 its transcript carries an owner record. That is expected, not a fault; `assign` settles it.
+
+Sessions assigned `personal` or `work` by hand under an earlier version follow the login that
+label belonged to when there is exactly one; otherwise they keep the word you typed, and
+`oe account rename personal primary` (or whichever name you mean) moves them.
 The table reads the same scan as `oe sessions`, so the
 [cap](#how-sessions-are-listed-and-where-the-cap-is) applies here too, and the table says so
 when it does.

@@ -499,6 +499,11 @@ def render(rows: List[Dict[str, Any]]) -> str:
     """
     now = time.time()
     root = paths.reports_root()
+    # BEFORE redacting: redaction returns a plain list, and the scope rides on
+    # the scan's own list object. Read after, and every page said all-time.
+    # `is None`, not `or`: an empty scan is falsy, and `or` would swap it for a
+    # fresh list and drop the scope it carries.
+    found, cap, capped = _scan_scope(rows if rows is not None else [])
     rows = redact.redact_scan_rows(rows or [])
     live = [r for r in rows if r.get("is_active")]
     live.sort(key=lambda r: -float(r.get("context_pct") or 0.0))
@@ -546,16 +551,15 @@ def render(rows: List[Dict[str, Any]]) -> str:
     parts.append(
         '<header><h1>Claude Code usage</h1>'
         f'<span class="muted mono">{len(live)} live &middot; {len(rows)} sessions'
-        + (f' (the newest of {_scan_scope(rows)[0]}; raise <code>scan.max_sessions</code> '
-           'to include older ones)' if _scan_scope(rows)[2] else '')
+        + (f' (the newest of {found}; raise <code>scan.max_sessions</code> '
+           'to include older ones)' if capped else '')
         + ' &middot; '
         f'refreshed {_esc(datetime.now().strftime("%H:%M:%S"))} '
         f'(auto every {REFRESH_SECONDS}s)</span></header>')
 
     parts.append('<div class="stats">')
     for key, value, sub in (
-        ("All-time spend" if not _scan_scope(rows)[2]
-         else f"Spend, newest {_scan_scope(rows)[1]} sessions",
+        ("All-time spend" if not capped else f"Spend, newest {cap} sessions",
          _agg_usd(rollup.get("total_usd"), costed),
          (f"{len(rows) - len(uncosted)} of {len(rows)} sessions costed"
           if uncosted else f"{len(rows)} sessions")),

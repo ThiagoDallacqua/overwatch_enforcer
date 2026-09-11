@@ -512,6 +512,9 @@ def _rows(active_within: Optional[int] = None) -> List[Dict[str, Any]]:
         rows = ledger_mod.scan_sessions(active_within_seconds=active_within)
     except Exception as exc:  # a broken corpus must not kill the CLI
         print(c(f"scan failed: {exc}", RED), file=sys.stderr)
+        # Forget the previous scan's scope: a cap caption left over from it
+        # would qualify totals this failure never produced.
+        _SCAN_SCOPE.update(found=0, cap=None)
         return []
     _SCAN_SCOPE["found"] = int(getattr(rows, "found", len(rows)) or len(rows))
     _SCAN_SCOPE["cap"] = getattr(rows, "cap", None)
@@ -657,6 +660,10 @@ def _account_rollup_lines(rows: List[Dict[str, Any]], width: int) -> List[str]:
             + f"{humanize_tokens(bucket['total_tokens']):>10}"
             + f"{money(bucket['cost_usd'], estimate=bucket.get('estimate')):>12}"
             + "   " + c(sources, DIM) + note)
+    # Every caller totals a scan, so every caller owes the cap sentence: here
+    # rather than at each call site, where one of two had already forgotten it.
+    if _scan_capped():
+        lines.append("  " + c(_scan_scope_note(), AMBER))
     return lines
 
 
@@ -1988,7 +1995,6 @@ def cmd_dashboard(args) -> int:
 
 def cmd_sessions(args) -> int:
     rows = _rows()
-    scanned = len(rows)
     rows = apply_account_filter(rows, getattr(args, "account", None))
     if rows is None:
         return 2
@@ -1997,6 +2003,9 @@ def cmd_sessions(args) -> int:
     if args.days:
         cutoff = time.time() - args.days * 86400
         rows = [r for r in rows if (r.get("mtime") or 0) >= cutoff]
+    # What the filters left, before the page cuts it: the footer's "of M" and
+    # its --limit 0 hint both mean THIS, not every transcript on disk.
+    available = len(rows)
     if args.limit:
         rows = rows[: args.limit]
     if args.json:
@@ -2057,9 +2066,8 @@ def cmd_sessions(args) -> int:
     # Both figures are computed over the rows actually PRINTED, and the count
     # LEADS with that scope: "N sessions" at the head of the line reads as a
     # total whatever follows it, and a narrow pane drops the tail first.
-    found = max(scanned, int(_SCAN_SCOPE.get("found") or 0))
-    if len(rows) < found:
-        head = f"{len(rows)} of {found} sessions shown, most recent first"
+    if len(rows) < available:
+        head = f"{len(rows)} of {available} sessions shown, most recent first"
         scope = " (totals cover the rows shown)"
     else:
         head = f"{len(rows)} sessions"
@@ -2071,8 +2079,8 @@ def cmd_sessions(args) -> int:
     covers = "" if not unknown else f" across {len(rows) - unknown} of them"
     footer = (f"\n  {head}, {money(total)} total{covers}, "
               f"{money(ledger_mod.spend_today(rows), estimate=True)} today{scope}")
-    if args.limit and len(rows) == args.limit and scanned > args.limit:
-        footer += f"\n  --limit {args.limit} shows the newest {args.limit}; --limit 0 lists all {scanned}"
+    if args.limit and len(rows) == args.limit and available > args.limit:
+        footer += f"\n  --limit {args.limit} shows the newest {args.limit}; --limit 0 lists all {available}"
     if _scan_capped():
         footer += "\n  " + _scan_scope_note()
     if unknown:
@@ -2236,8 +2244,6 @@ def cmd_account(args) -> int:
         print()
         for line in _account_rollup_lines(rows, width):
             print(line)
-        if _scan_capped():
-            print("  " + c(_scan_scope_note(), AMBER))
         print()
         print(rule(width, "provenance"))
         counts = accounts_mod.provenance_counts(rows)
@@ -4590,8 +4596,8 @@ def build_parser() -> argparse.ArgumentParser:
             name, help=f"{verb} a hand-made label on the sessions a selector names")
         # Positionals are order-free on purpose: the documented form is
         # `assign <selector> <label>` but `assign <label> <selector>` reads just
-        # as naturally, and the two are told apart by VALUE (only 'personal' and
-        # 'work' normalise to a label) rather than by position.
+        # as naturally, and the two are told apart by VALUE (only a label this
+        # machine knows normalises to one) rather than by position.
         entry.add_argument("target", nargs="*",
                            help=("session id or id prefix"
                                  + (", plus a label (see `oe account list`)"
