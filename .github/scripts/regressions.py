@@ -692,15 +692,18 @@ def check_upgrade_swaps_in_only_on_success() -> Tuple[bool, Any]:
 # a process that stays the checker's own child lingers as a zombie after it is
 # killed, and a zombie still answers kill(pid, 0) -- which would make a correct
 # stop look like a failed one.
+# It writes its pid BEFORE waiting for the lock, so one that never gets it can
+# still be found and killed.
 _LOCK_HOLDER = """
 import fcntl, os, sys, time
 if os.fork():
     os._exit(0)
 os.setsid()
-handle = open(sys.argv[1], "a+")
-fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
 with open(sys.argv[2], "w") as note:
     note.write(str(os.getpid()))
+handle = open(sys.argv[1], "a+")
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+open(sys.argv[2] + ".held", "w").close()
 time.sleep(120)
 """
 
@@ -714,15 +717,32 @@ def _supervisor_sandbox():
         try:
             yield env, state, holders
         finally:
-            for pid in holders:
-                if pid > 0 and _alive(pid):
-                    with contextlib.suppress(OSError):
-                        os.kill(pid, 9)
             _oe(env, "supervise", "--stop", "--quiet")
-            pid = _pidfile(state).get("pid")
-            if isinstance(pid, int) and pid > 0 and _alive(pid):
-                with contextlib.suppress(OSError):
-                    os.kill(pid, 9)
+            # The backstop that does not depend on any record: every process
+            # started in this sandbox carries its OE_STATE_DIR, including a
+            # supervisor the code under test started and no pidfile names.
+            _clear_sandbox(state, holders)
+
+
+def _sandbox_pids(state: Path) -> List[int]:
+    """Every live process whose environment points at this sandbox's state dir."""
+    needle = f"OE_STATE_DIR={state}".encode("utf-8")
+    found = []
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            if needle in (entry / "environ").read_bytes().split(b"\0"):
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return [pid for pid in found if pid != os.getpid()]
+
+
+def _clear_sandbox(state: Path, holders: List[int]) -> None:
+    for pid in set(holders) | set(_sandbox_pids(state)):
+        if pid > 0 and _alive(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+            _wait_dead(pid)
 
 
 def _oe(env: Dict[str, str], *argv: str) -> Tuple[int, str]:
@@ -758,19 +778,30 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def _hold_lock(state: Path, *argv: str) -> int:
+def _hold_lock(env: Dict[str, str], state: Path, holders: List[int], *argv: str) -> int:
     """A stand-in supervisor: holds the lock, shows `argv` on its command line,
-    and is nobody's child. Returns its pid once the lock is held (0 on failure)."""
+    and is nobody's child. Its pid goes into `holders` as soon as it is known,
+    so the sandbox kills it even if it never gets the lock. Returns the pid once
+    the lock is held, 0 if it was not."""
     note = state / f"holder-{time.time_ns()}.pid"
     subprocess.run([sys.executable, "-c", _LOCK_HOLDER, str(state / "supervisor.lock"),
-                    str(note), *argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=30)
+                    str(note), *argv], env=env, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=30)
     deadline = time.time() + 10
-    while time.time() < deadline:
+    pid = 0
+    while time.time() < deadline and not pid:
         with contextlib.suppress(Exception):
             text = note.read_text(encoding="utf-8").strip()
-            if text:
-                return int(text)
+            pid = int(text) if text else 0
+        if not pid:
+            time.sleep(0.05)
+    if not pid:
+        return 0
+    holders.append(pid)
+    held = Path(str(note) + ".held")
+    while time.time() < deadline:
+        if held.exists():
+            return pid
         time.sleep(0.05)
     return 0
 
@@ -814,8 +845,7 @@ def check_ensure_restarts_a_legacy_detached_supervisor() -> Tuple[bool, Any]:
     code -- 1.0.3 and earlier -- is replaced when its command line shows it is
     a detached daemon. That is the supervisor every upgrading machine has."""
     with _supervisor_sandbox() as (env, state, holders):
-        pid = _hold_lock(state, "supervise", "--ensure")
-        holders.append(pid)
+        pid = _hold_lock(env, state, holders, "supervise", "--ensure")
         if not pid:
             return False, "stand-in did not take the lock"
         (state / "supervisor.pid").write_text(json.dumps({"pid": pid}), encoding="utf-8")
@@ -834,20 +864,26 @@ def check_ensure_never_kills_an_inline_supervisor() -> Tuple[bool, Any]:
     with _supervisor_sandbox() as (env, state, holders):
         for label, argv, extra in (("recorded", ("watch",), {"mode": "thread", "code": "0" * 16}),
                                    ("legacy", ("watch", "--inline"), {})):
-            pid = _hold_lock(state, *argv)
-            holders.append(pid)
+            pid = _hold_lock(env, state, holders, *argv)
             if not pid:
                 return False, f"{label}: stand-in did not take the lock"
             (state / "supervisor.pid").write_text(json.dumps({"pid": pid, **extra}),
                                                   encoding="utf-8")
             _, out = _oe(env, "supervise", "--ensure")
-            seen[label] = {"alive": _alive(pid), "out": out.strip()}
-            with contextlib.suppress(OSError):
-                os.kill(pid, 9)
-            _wait_dead(pid)
+            alive = _alive(pid)
+            replacement = None
+            if not alive:
+                record = _wait_pidfile(state, lambda r: bool(r.get("pid")) and r.get("pid") != pid,
+                                       timeout=5)
+                replacement = record.get("pid")
+            seen[label] = {"alive": alive, "replaced_by": replacement, "out": out.strip()}
+            # Wipe the sandbox between rounds -- stand-in, and anything that
+            # replaced it -- so the next round starts with the lock free.
+            _clear_sandbox(state, holders)
             with contextlib.suppress(OSError):
                 (state / "supervisor.pid").unlink()
-    ok = all(v["alive"] and "already running" in v["out"] for v in seen.values())
+    ok = all(v["alive"] and not v["replaced_by"] and "already running" in v["out"]
+             for v in seen.values())
     return ok, seen
 
 
