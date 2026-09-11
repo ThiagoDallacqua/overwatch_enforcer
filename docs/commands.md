@@ -216,6 +216,33 @@ correct behaviour anyway, since a cached snippet could show text an edit has alr
 invalidated. Every public entry point **fails open**, and a corrupt database is renamed aside
 to `context.db.corrupt-<stamp>` and rebuilt rather than raised.
 
+### `oe brief <prompt>`
+
+What a subagent spawned on this prompt would be handed, and what it would cost. `--file` reads
+the prompt from a file, `--budget N` sets the token ceiling (default 1500), `--show` prints the
+brief itself rather than only its size, and `--json` gives the shape and the arithmetic without
+the outline bodies — those are your source, and they have no business in a pipe.
+
+```
+$ oe brief "rework the launcher digest"
+```
+
+The brief is a ranked set of **symbol tables** — what `oe slice <path>` prints with no target —
+for the files the task looks like it is about, plus one directional hop along the import graph
+out of the strongest of them. That is the shape `oe deps` already uses, applied to a prompt
+instead of a path. It carries no file bodies and says so in its own text: an agent that treats
+a symbol table as the content will read the file anyway, and then the window pays twice.
+
+**Why there is a budget rather than a file count.** Anything handed to an agent at spawn is
+resident for that agent's whole life and re-billed on every request it makes, whereas a read
+that happens late is carried by far fewer. A budget bounds that downside directly; a file count
+bounds only the number of guesses.
+
+**Retrieval is often wrong, and the command says so.** Measured on this machine, a brief names
+a minority of the files an agent goes on to read, and for a prompt with no real signal it will
+still return whatever the index ranked highest. Read the output before trusting it. This is the
+reason the brief is inspectable as a command at all rather than only ever being injected.
+
 ### `oe index [roots…]`
 
 Incremental: only files whose mtime or size changed. With no argument it re-scans the roots of

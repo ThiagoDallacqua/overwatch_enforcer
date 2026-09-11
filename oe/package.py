@@ -117,7 +117,7 @@ ROOT_FILES: Tuple[str, ...] = (
 TREES: Dict[str, Optional[frozenset]] = {
     "oe": frozenset({
         "__init__.py",
-        "accounts.py",
+        "accounts.py", "brief.py",
         "autostart.py",
         "checklist.py",
         "corpus.py",

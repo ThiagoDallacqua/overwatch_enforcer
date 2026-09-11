@@ -81,6 +81,7 @@ READ_ONLY = (
     ("savings", ["savings"]),
     ("rereads", ["rereads"]),
     ("shrink", ["shrink", "--limit", "3"]),
+    ("brief", ["brief", "index the retrieval store"]),
     ("find", ["find", "atomic_write"]),
     ("deps", ["deps", "oe/paths.py"]),
     ("slice", ["slice", "oe/paths.py", "atomic_write"]),
