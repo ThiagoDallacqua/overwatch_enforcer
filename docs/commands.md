@@ -6,7 +6,7 @@
 
 **Each block below shows how to invoke the command, not what it prints.**
 
-v1.0.3 still ships no captured sample output. The blocks that used to be here were produced by a
+v1.0.4 still ships no captured sample output. The blocks that used to be here were produced by a
 fixture whose generator was never committed, which meant nothing could check that the figures
 in them came from that fixture rather than from a real session — and this project does not
 ship a number it cannot account for. Rather than ask you to take that on trust, the output is
