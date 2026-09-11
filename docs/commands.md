@@ -6,12 +6,12 @@
 
 **Each block below shows how to invoke the command, not what it prints.**
 
-v1.0.1 still ships no captured sample output. The blocks that used to be here were produced by a
+v1.0.2 still ships no captured sample output. The blocks that used to be here were produced by a
 fixture whose generator was never committed, which meant nothing could check that the figures
 in them came from that fixture rather than from a real session — and this project does not
 ship a number it cannot account for. Rather than ask you to take that on trust, the output is
 gone until it can be regenerated from a fixture that ships with the tool and is verified on
-every build. That is planned for v1.0.1.
+every build. No release is promised for it here until the generator exists.
 
 Run any command below against your own sessions to see its real output. Piped or redirected,
 every command redacts by default ([Privacy](privacy.md)): `session_01`, `project_01`, `-` for

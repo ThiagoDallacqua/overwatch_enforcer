@@ -37,7 +37,7 @@ anyway and the gap is named in it rather than the run aborting. `summary.md` gro
 6 request(s) used a model this build's pricing catalog has no entry for (claude-zeta-9-20260101), and were counted as $0.00. Every dollar figure above is therefore a FLOOR. `oe reprice` refreshes the catalog.
 ```
 
-**There is no per-tool wall time at all.** It is in the transcript nowhere, and `v1.0.1`
+**There is no per-tool wall time at all.** It is in the transcript nowhere, and `v1.0.2`
 registers no hook on the tool-call path to collect it, so the tool table shows counts, result
 bytes and error counts and says *no timing* on every session, installed or not.
 
@@ -163,7 +163,7 @@ python3 $OE/bin/oe-repair        # names every registration pointing at nothing
 python3 $OE/bin/oe-repair --all  # also examines entries belonging to other tools
 ```
 
-**v1.0.1 diagnoses only.** `--yes` is accepted, refused, and explained. The repair path is
+**v1.0.2 diagnoses only.** `--yes` is accepted, refused, and explained. The repair path is
 held back one release because it can remove a registration that is *working*: it resolves
 `$CLAUDE_PROJECT_DIR` and relative hook paths against whichever directory you are standing
 in, and it reads the subcommand of a wrapper (`uv run x.py`, `npx tsx x.ts`) as the script
