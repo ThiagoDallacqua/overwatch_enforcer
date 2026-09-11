@@ -1629,8 +1629,8 @@ def render_html(ledger_dict: Dict[str, Any]) -> str:
     # pseudonym back to the real session, on the machine that produced it.
     # Label + provenance, never the address or the accountUuid: this document
     # is the artifact, and identity is PII. A provenance that is a GUESS is
-    # marked as one and explained below the meta line: 'work (inferred)' set in
-    # the same chip as 'work (recorded)' would read as a fact nobody checked.
+    # marked as one and explained below the meta line: 'primary (backup)' set in
+    # the same chip as 'primary (recorded)' would read as a fact nobody checked.
     account_label = str(session.get("account_label") or "unknown")
     account_source = str(session.get("account_source") or "")
     account_guess = accounts.is_guess(account_source) if account_source else False

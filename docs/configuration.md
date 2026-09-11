@@ -21,12 +21,14 @@ nothing in the code depends on this directory being called anything in particula
   than writing nothing or throwing inside a status line. That is a misconfiguration people
   **inherit**, not one they made, and untracking the file is what stops a clone inheriting one.
 * **Account labels self-configure.** There is no address in any shipped file. The first
-  account the tool sees becomes `primary`, the next `secondary`, and the address-to-label map
-  lives in `state/accounts.json`, which never leaves the machine. `oe account rename secondary
-  work` renames it everywhere; `config.json` → `accounts` can pin one explicitly.
+  account the tool sees log in becomes `primary`, the next `secondary`, and the
+  address-to-label map lives in `state/accounts.json`, which never leaves the machine. A label
+  names a login and nothing more: `oe account rename secondary laptop` renames it everywhere,
+  and `config.json` → `accounts` can pin one explicitly.
 * **Provenance is labelled, never guessed silently.** `recorded` = the transcript's own
-  bridge-session owner id. `inferred` = a low-confidence hint, printed with its evidence.
-  `unknown` = nothing on disk names an account.
+  bridge-session owner id. `stamped` = captured from the live login. `backup` = a config
+  snapshot brackets the session, marked as unverified. `unknown` = nothing on disk names an
+  account — usually a session that finished before the tool was installed.
 
 **On a machine with no history** every command runs and returns a sensible empty state rather
 than a traceback. Captured against an empty `$HOME` with no transcripts, no state directory
@@ -78,7 +80,7 @@ is absent. Nothing else touches it.
 | `scan.active_within_seconds` | `900` | a session counts as "recent" within this |
 | `scan.tail_bytes` | `262144` | bytes read from the end in a cheap scan |
 | `scan.head_bytes` | `65536` | bytes read from the start in a cheap scan |
-| `scan.max_sessions` | `500` | cap on a scan |
+| `scan.max_sessions` | `500` | how many of the most recent sessions any listing or total covers; older ones are left out, and every capped screen says so ([how sessions are listed](commands.md#how-sessions-are-listed-and-where-the-cap-is)) |
 | `insights.top_turns` | `8` | rows in the per-turn insight |
 | `insights.top_tools` | `12` | rows in the tool table |
 | `insights.top_subagents` | `8` | rows in the subagent insight |
@@ -87,7 +89,7 @@ is absent. Nothing else touches it.
 | `insights.carry_usd_per_1k` | `0.126` | the fixed forward-carry rate `oe rereads` prices its `calibrated` column with. Not in the shipped file; add it to override |
 | `report.include_raw_calls` | `true` | write the raw-API-requests section of the report |
 | `report.max_raw_calls` | `4000` | cap on that section |
-| `accounts` | `{}` | optional explicit label pins; **empty by design** — labels self-configure |
+| `accounts` | `{}` | optional explicit label pins (`accounts.labels`: address → label); **empty by design** — labels self-configure |
 | `redact_cli` | `"auto"` | `auto` \| `always` \| `never` ([Privacy](privacy.md#the-controls)) |
 
 A `supervisor` block is honoured if you add one. None of these keys is in the shipped file;

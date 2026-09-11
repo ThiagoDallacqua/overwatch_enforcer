@@ -396,7 +396,7 @@ def _account_cell(row: Dict[str, Any], *, with_source: bool = True) -> str:
 
     A label whose provenance is a GUESS carries a visible '?' and a dashed
     border, not just a different tooltip: the badge colour keys off the label, so
-    an inferred 'work' and a recorded 'work' would otherwise be the same blue
+    a bracketed 'primary' and a recorded 'primary' would otherwise be the same
     pill with nothing on the page saying which one you are reading. The tooltip
     text comes from accounts.SOURCE_NOTE, a fixed sentence per enum value --
     account_evidence is deliberately not in the artifact allowlist because it
@@ -480,6 +480,17 @@ def _history_row(row: Dict[str, Any], root: Path, now: float) -> str:
     )
 
 
+def _scan_scope(rows: Any) -> Tuple[int, Optional[int], bool]:
+    """(sessions that exist, cap, capped) for a scan_sessions() result.
+
+    A capped scan holds only the newest `cap` sessions, so a figure the page
+    calls all-time would be false without this.
+    """
+    found = int(getattr(rows, "found", 0) or len(rows))
+    cap = getattr(rows, "cap", None)
+    return found, cap, bool(cap) and found > int(cap)
+
+
 def render(rows: List[Dict[str, Any]]) -> str:
     """The whole page as one string. Pure: give it rows, get HTML.
 
@@ -534,13 +545,18 @@ def render(rows: List[Dict[str, Any]]) -> str:
     parts.append('<div class="wrap">')
     parts.append(
         '<header><h1>Claude Code usage</h1>'
-        f'<span class="muted mono">{len(live)} live &middot; {len(rows)} sessions &middot; '
+        f'<span class="muted mono">{len(live)} live &middot; {len(rows)} sessions'
+        + (f' (the newest of {_scan_scope(rows)[0]}; raise <code>scan.max_sessions</code> '
+           'to include older ones)' if _scan_scope(rows)[2] else '')
+        + ' &middot; '
         f'refreshed {_esc(datetime.now().strftime("%H:%M:%S"))} '
         f'(auto every {REFRESH_SECONDS}s)</span></header>')
 
     parts.append('<div class="stats">')
     for key, value, sub in (
-        ("All-time spend", _agg_usd(rollup.get("total_usd"), costed),
+        ("All-time spend" if not _scan_scope(rows)[2]
+         else f"Spend, newest {_scan_scope(rows)[1]} sessions",
+         _agg_usd(rollup.get("total_usd"), costed),
          (f"{len(rows) - len(uncosted)} of {len(rows)} sessions costed"
           if uncosted else f"{len(rows)} sessions")),
         ("Today", _agg_usd(spend_today, today_rows), today_key),
@@ -625,6 +641,8 @@ def write_dashboard(reports_root: Optional[str | os.PathLike] = None) -> Path:
         listing = json.dumps({
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "live_window_seconds": window,
+            # How much of the corpus `sessions` covers: the newest `cap` of `found`.
+            "scan": {"found": _scan_scope(rows)[0], "cap": _scan_scope(rows)[1]},
             "redaction": {"version": redact.REDACTION_VERSION, "policy": "allowlist",
                           "note": redact.REDACTION_NOTE},
             "rollup": redact.redact_rollup(ledger.daily_rollup(rows)),

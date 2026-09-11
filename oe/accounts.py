@@ -1,18 +1,22 @@
 """Which Claude Code account paid for a session, and how well we know it.
 
-The rule the user asked for is deliberately trivial:
+The rule is deliberately trivial:
 
     email == the first account this machine saw  ->  'primary'
-    any other email                          ->  'work'
+    any other login                          ->  'secondary' (then secondary-2, ...)
     no email recoverable                     ->  'unknown'
+
+A label names a LOGIN this machine has seen, nothing else. There is no
+personal/work split: which account is which is the user's business, and
+`oe account rename` is how they say it.
 
 Everything else in this module exists because the *email* is rarely on disk.
 Claude Code keeps exactly one account in ~/.claude.json and overwrites it on
 every switch, so the identity of a session that ran under a previous login has
 to be recovered from weaker records. Each recovery path is named, and every
-answer carries the name of the path that produced it, because "personal"
-guessed from a heuristic and "personal" read out of the transcript are not the
-same claim and must not render identically.
+answer carries the name of the path that produced it, because "primary"
+bracketed by a config snapshot and "primary" read out of the transcript are not
+the same claim and must not render identically.
 
     assigned  the user said so (`oe account assign`)
     recorded  the transcript's own 'bridge-session' line names ownerAccountUuid
@@ -21,13 +25,12 @@ same claim and must not render identically.
               it survives the account switch that erases ~/.claude.json
     backup    a ~/.claude/backups/.claude.json.backup.<ms> snapshot brackets the
               session's start time and the snapshots either side of it agree
-    inferred  a low-confidence hint, rendered only as a guess, with its evidence
     unknown   nothing is known -- say so, never guess
 
 PII: the email address and the accountUuid are identity, and they never leave
 this module's state file under paths.state_dir(). Every field this module puts
 on a row, a report payload or a meta.json is a LABEL plus a SOURCE plus (for
-'inferred') a sentence of evidence. That is safe by construction: there is no
+'backup') a sentence of evidence. That is safe by construction: there is no
 code path that copies an address or a uuid into an artifact.
 """
 
@@ -56,14 +59,13 @@ LABEL_PRIMARY = "primary"
 LABEL_SECONDARY = "secondary"
 LABEL_UNKNOWN = "unknown"
 
-# Aliases, kept forever. An install made before labels became self-configuring
-# wrote these into state/accounts.json and into per-session meta files; they
-# stay valid so an upgrade never silently re-labels history.
-LABEL_PERSONAL = "personal"
-LABEL_WORK = "work"
+# The names an install made before labels became self-configuring wrote into
+# state. They are no longer labels: the one-time state upgrade (_upgrade) moves
+# every stored one onto the current names, collision-safe, so a machine that
+# used them keeps the same accounts under the names everybody else sees.
+_LEGACY_LABELS: Tuple[str, ...] = ("personal", "work")
 
-RESERVED_LABELS: Tuple[str, ...] = (
-    LABEL_PRIMARY, LABEL_SECONDARY, LABEL_PERSONAL, LABEL_WORK, LABEL_UNKNOWN)
+RESERVED_LABELS: Tuple[str, ...] = (LABEL_PRIMARY, LABEL_SECONDARY, LABEL_UNKNOWN)
 
 
 def known_labels() -> Tuple[str, ...]:
@@ -105,17 +107,19 @@ def __getattr__(name: str):
 # Highest confidence first. resolve() walks this in order and stops at the
 # first source that can answer, which IS the precedence rule.
 SOURCE_ORDER: Tuple[str, ...] = (
-    "assigned", "recorded", "stamped", "backup", "inferred", "unknown")
+    "assigned", "recorded", "stamped", "backup", "unknown")
 SOURCE_RANK: Dict[str, int] = {name: i for i, name in enumerate(SOURCE_ORDER)}
 
 # Which of those sources are a RECORD and which are a GUESS. A renderer must be
 # able to tell them apart without knowing what each name means, because a
 # document that prints a hint in the same ink as a record asserts something
 # nobody checked -- and the artifacts are the half of this system that gets
-# shared. 'backup' is circumstantial (a snapshot window, not the session) and
-# 'inferred' is a heuristic; the other four either read the answer or were told
-# it.
-LOW_CONFIDENCE_SOURCES: Tuple[str, ...] = ("backup", "inferred")
+# shared. 'backup' is circumstantial (a snapshot window, not the session); the
+# others either read the answer or were told it. A heuristic source used to sit
+# here too, guessing 'work' from an organization-level quota policy. It could
+# only ever produce a label no login on the machine had, so it was removed
+# rather than renamed.
+LOW_CONFIDENCE_SOURCES: Tuple[str, ...] = ("backup",)
 
 # What each source actually did, as a fixed sentence per enum value. Enumerated
 # and constant, NOT generated text: this is what goes into report.html and the
@@ -130,13 +134,8 @@ SOURCE_NOTE: Dict[str, str] = {
                "snapshot taken before it started and the next one taken after it both "
                "name the same account. That brackets the session; it does not record "
                "it. Confirm it with `oe account assign`."),
-    "inferred": ("No account is named for this session. Its transcript carries an "
-                 "organization-level overage policy (quotaLimits."
-                 "overageDisabledReason == 'org_level_disabled_until'), which points "
-                 "at an organization rather than an individual plan. It is a hint "
-                 "only -- a personal plan can sit in an organization too -- so treat "
-                 "this label as unconfirmed and settle it with `oe account assign`."),
-    "unknown": "Nothing on disk names an account for this session.",
+    "unknown": ("Nothing on disk names an account for this session -- usually because "
+                "it ran before this tool was installed. Set it with `oe account assign`."),
 }
 
 
@@ -147,7 +146,9 @@ def is_guess(source: Any) -> bool:
 CLAUDE_JSON = paths.CLAUDE_HOME.parent / ".claude.json"
 BACKUPS_DIR = paths.CLAUDE_HOME / "backups"
 
-STATE_VERSION = 1
+# 2: 'personal'/'work' retired, the org-hint bucket dropped, and label_map
+# entries for addresses that never logged in pruned. See _upgrade().
+STATE_VERSION = 2
 _STATE_NAME = "accounts.json"
 
 # A 'bridge-session' line is NOT a header. Most transcripts that carry one put
@@ -165,10 +166,6 @@ _STATE_NAME = "accounts.json"
 # so a cold cache cannot stall the first `oe watch` frame. `oe account list`
 # passes an unlimited budget, because its whole job is the complete answer.
 _SCAN_BYTES_PER_PASS = 48 * 1024 * 1024
-
-# Full-file scan for the org-quota hint. Only ever run on demand (`oe account
-# list`), never on the hot scan path, and cached once computed.
-_INFER_BYTES = 64 * 1024 * 1024
 
 
 def _now() -> float:
@@ -204,6 +201,72 @@ def _legacy_personal_email(config: Optional[Dict[str, Any]] = None) -> str:
         return str((cfg.get("accounts") or {}).get("personal_email") or "").strip().lower()
     except Exception:
         return ""
+
+
+def _pinned_labels(config: Optional[Dict[str, Any]] = None) -> set:
+    """Labels a config reserves for a specific address, whether or not the
+    address has been seen yet."""
+    out = set(_config_labels(config).values())
+    if _legacy_personal_email(config):
+        out.add(LABEL_PRIMARY)
+    return out
+
+
+def _login_addresses(state: Dict[str, Any],
+                     config: Optional[Dict[str, Any]] = None) -> set:
+    """Every address this machine has seen LOG IN, plus the pinned ones.
+
+    identities is complete for logins: current_identity() and
+    backup_attestations() both record every account they read. So an address
+    outside this set was only ever MENTIONED somewhere -- in a transcript, in a
+    commit trailer -- and is somebody else's.
+    """
+    out = {str((row or {}).get("email") or "").strip().lower()
+           for row in (state.get("identities") or {}).values() if isinstance(row, dict)}
+    out |= set(_config_labels(config))
+    legacy = _legacy_personal_email(config)
+    if legacy:
+        out.add(legacy)
+    out.discard("")
+    return out
+
+
+def _stored_label(text: str, config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """The label already decided for an address -- pin, legacy pin, learned map.
+    Never allocates."""
+    pinned = _config_labels(config).get(text)
+    if pinned:
+        return pinned
+    legacy = _legacy_personal_email(config)
+    if legacy and text == legacy:
+        return LABEL_PRIMARY
+    try:
+        known = (load_state().get("label_map") or {}).get(text)
+    except Exception:
+        known = None
+    if isinstance(known, str) and known.strip():
+        return known.strip()
+    return None
+
+
+def known_label_for_email(email: Optional[str],
+                          config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """The label of one of THIS machine's logins, or None. Never allocates.
+
+    For the scrubber, which meets addresses in free text. An address qualifies
+    only if this machine saw it log in; anything else is a third party, and
+    labelling it would both claim it is one of your accounts and write it to
+    state. label_for_email() is for addresses KNOWN to be logins.
+    """
+    text = str(email or "").strip().lower()
+    if not text:
+        return None
+    try:
+        if text not in _login_addresses(load_state(), config):
+            return None
+    except Exception:
+        return None
+    return _stored_label(text, config)
 
 
 def _seed_label_map(state: Dict[str, Any]) -> bool:
@@ -249,8 +312,11 @@ def allocate_label(address: str) -> str:
         if existing:
             chosen.append(existing)
             return changed
-        taken = {str(v).strip() for v in mapping.values()}
-        if not mapping:
+        # Pinned labels are taken too: a config that says "this address is
+        # primary" must not see a second address allocated 'primary' merely
+        # because the learned map happened to be empty.
+        taken = {str(v).strip() for v in mapping.values()} | _pinned_labels()
+        if not mapping and LABEL_PRIMARY not in taken:
             name = LABEL_PRIMARY
         else:
             name = LABEL_SECONDARY
@@ -319,19 +385,7 @@ def label_for_email(email: Optional[str],
     text = str(email or "").strip().lower()
     if not text:
         return LABEL_UNKNOWN
-    pinned = _config_labels(config).get(text)
-    if pinned:
-        return pinned
-    legacy = _legacy_personal_email(config)
-    if legacy:
-        return LABEL_PERSONAL if text == legacy else LABEL_WORK
-    try:
-        known = (load_state().get("label_map") or {}).get(text)
-    except Exception:
-        known = None
-    if isinstance(known, str) and known.strip():
-        return known.strip()
-    return allocate_label(text)
+    return _stored_label(text, config) or allocate_label(text)
 
 
 # ---------------------------------------------------------------------------
@@ -354,13 +408,79 @@ def _blank_state() -> Dict[str, Any]:
         "assigned": {},
         # session_id -> {"uuid": str|None, "scanned_bytes": int}
         "recorded": {},
-        # session_id -> {"hint": str|None, "scanned_bytes": int}
-        "inferred": {},
     }
 
 
 _CACHE: Dict[str, Any] = {"mtime": -1.0, "data": None}
 _ATTEST_CACHE: Dict[str, Any] = {"key": None, "value": None}
+
+
+def _each_label_holder(state: Dict[str, Any]):
+    """Every dict in state that carries a 'label', plus the address map itself."""
+    for bucket in ("identities", "stamped", "assigned"):
+        rows = state.get(bucket)
+        if isinstance(rows, dict):
+            for row in rows.values():
+                if isinstance(row, dict) and "label" in row:
+                    yield row
+
+
+def _upgrade(state: Dict[str, Any]) -> bool:
+    """Bring a state file written by an older build up to STATE_VERSION, in place.
+
+    v1 -> v2, once:
+      * label_map entries for addresses that never logged in here are dropped.
+        Only the scrubber ever put them there -- it allocated a label for every
+        address it met -- no session can resolve to one, and each is a third
+        party's address sitting in local state.
+      * 'personal'/'work' move to current names. Collision-safe: an install that
+        allocated after the rename can hold 'work' AND 'secondary', and a blind
+        rename would merge two accounts into one label.
+      * the 'inferred' bucket goes with the heuristic that filled it.
+
+    Runs only on a v1 file, so a label a user LATER chooses to call 'work' is
+    theirs to keep. Never raises.
+    """
+    try:
+        if int(state.get("version") or 1) >= 2:
+            return False
+        changed = state.pop("inferred", None) is not None
+        mapping = state.get("label_map")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        logins = _login_addresses(state)
+        for address in list(mapping):
+            if str(address).strip().lower() not in logins:
+                del mapping[address]
+                changed = True
+        labels = [str(v).strip() for v in mapping.values()]
+        labels += [str(row.get("label") or "").strip() for row in _each_label_holder(state)]
+        in_use = {name for name in labels if name and name not in _LEGACY_LABELS}
+        rename: Dict[str, str] = {}
+        for old in _LEGACY_LABELS:
+            if old not in labels:
+                continue
+            wanted = ([LABEL_PRIMARY] if old == "personal" else []) + [LABEL_SECONDARY]
+            name = next((n for n in wanted if n not in in_use), None)
+            counter = 2
+            while name is None:
+                candidate = f"{LABEL_SECONDARY}-{counter}"
+                counter += 1
+                if candidate not in in_use:
+                    name = candidate
+            rename[old] = name
+            in_use.add(name)
+        if rename:
+            for address, label in list(mapping.items()):
+                if str(label).strip() in rename:
+                    mapping[address] = rename[str(label).strip()]
+            for row in _each_label_holder(state):
+                if str(row.get("label") or "").strip() in rename:
+                    row["label"] = rename[str(row["label"]).strip()]
+            changed = True
+        return changed
+    except Exception:
+        return False
 
 
 def load_state() -> Dict[str, Any]:
@@ -385,8 +505,15 @@ def load_state() -> Dict[str, Any]:
                             data[key] = value
                     else:
                         data[key] = value
+                if "version" not in raw:
+                    data["version"] = 1
         except Exception:
             data = _blank_state()
+    # In memory only: READING state never writes it. A leak gate or a status
+    # line that merely looks at labels must not rewrite the file under its user,
+    # and a lint run once did exactly that. The next genuine write goes through
+    # _mutate, which runs the same upgrade under the lock and persists it then.
+    _upgrade(data)
     _CACHE["mtime"] = mtime
     _CACHE["data"] = data
     return data
@@ -461,12 +588,16 @@ def _mutate(apply) -> Dict[str, Any]:
                             data[key] = value
                     else:
                         data[key] = value
+                if "version" not in raw:
+                    data["version"] = 1
         except Exception:
             pass
+        upgraded = _upgrade(data)
         try:
             changed = bool(apply(data))
         except Exception:
             changed = False
+        changed = changed or upgraded
         if changed:
             data["version"] = STATE_VERSION
             try:
@@ -869,98 +1000,6 @@ def _short_time(epoch: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 'inferred': the org-level quota hint. A HINT. Never a fact.
-# ---------------------------------------------------------------------------
-
-
-def _scan_org_hint(transcript: Path) -> Tuple[Optional[str], int]:
-    """Look for a quotaLimits record carrying an ORG-level overage policy.
-
-    A line that carries one was served under an organization's overage policy.
-    That is a hint about an ORGANIZATION, not proof about the address, and it is
-    weaker than it first looks: a personal plan can also sit in an organization
-    of its own, with the owner as its only admin, so the marker does not by
-    itself separate a work seat from a personal plan. It is the LAST source
-    resolve() will accept, it never outranks a record, and every renderer must
-    show it as a guess with this evidence attached.
-
-    The substring test only narrows the candidate lines; the decision is made on
-    a parsed top-level quotaLimits object. That distinction is load-bearing: a
-    transcript that merely QUOTES the marker -- a prompt about this feature, a
-    pasted log -- would otherwise be labelled off its own prompt text.
-    labelled the session off its own prompt text.
-    """
-    marker = b"org_level_disabled_until"
-    read = 0
-    try:
-        with open(transcript, "rb") as handle:
-            for line in handle:
-                read += len(line)
-                if read > _INFER_BYTES:
-                    break
-                if marker not in line:
-                    continue
-                try:
-                    obj = json.loads(line.decode("utf-8", "replace"))
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                quota = obj.get("quotaLimits")
-                if (isinstance(quota, dict)
-                        and quota.get("overageDisabledReason") == "org_level_disabled_until"):
-                    return ("org_quota", read)
-    except Exception:
-        return None, read
-    return None, read
-
-
-# What the org hint actually saw. A CONSTANT read at render time, never the copy
-# in the state file: the sentence is wording, not evidence, and a cached row
-# written months ago must not keep publishing a claim the code no longer makes.
-ORG_HINT_EVIDENCE = (
-    "quotaLimits.overageDisabledReason == 'org_level_disabled_until' "
-    "-- an organization-level overage policy. A hint about an organization, NOT "
-    "a record of an account: a personal plan can sit in an organization too. "
-    "Confirm with `oe account assign`.")
-
-
-def org_hint(session_id: str, transcript: Optional[Path]) -> Optional[Dict[str, Any]]:
-    """Cached org-level hint for a session, or None. Scans the file at most once."""
-    st = load_state()
-    row = (st.get("inferred") or {}).get(session_id)
-    if isinstance(row, dict) and "hint" in row:
-        if "evidence" in row:
-            # Written by an older build, which stored the sentence alongside the
-            # fact. Drop it once so the state file never holds a claim the code
-            # has since reworded.
-            def drop(state: Dict[str, Any]) -> bool:
-                entry = (state.get("inferred") or {}).get(session_id)
-                if isinstance(entry, dict) and "evidence" in entry:
-                    entry.pop("evidence", None)
-                    return True
-                return False
-
-            _mutate(drop)
-        return {"label": LABEL_WORK, "evidence": ORG_HINT_EVIDENCE} \
-            if row.get("hint") else None
-    if transcript is None:
-        return None
-    hint, scanned = _scan_org_hint(Path(transcript))
-
-    def apply(state: Dict[str, Any]) -> bool:
-        table = state.setdefault("inferred", {})
-        entry = {"hint": hint, "scanned_bytes": scanned}
-        if table.get(session_id) == entry:
-            return False
-        table[session_id] = entry
-        return True
-
-    _mutate(apply)
-    return {"label": LABEL_WORK, "evidence": ORG_HINT_EVIDENCE} if hint else None
-
-
-# ---------------------------------------------------------------------------
 # resolution
 # ---------------------------------------------------------------------------
 
@@ -980,14 +1019,12 @@ def _epoch(value: Any) -> Optional[float]:
 
 
 def resolve(session_id: str, transcript: Optional[Path] = None, *,
-            started_at: Any = None, active: bool = False, infer: bool = False,
+            started_at: Any = None, active: bool = False,
             attestations: Optional[List[Dict[str, Any]]] = None,
             budget: Optional[List[int]] = None) -> Dict[str, Any]:
     """{label, source, evidence} for one session, best source first.
 
-    `active` permits a live stamp (see stamp_session); `infer` permits the
-    expensive full-file org hint, which is why the hot scan path leaves it off;
-    `budget` is the shared [bytes_left] for the transcript scan.
+    `active` permits a live stamp (see stamp_session); `budget` is the shared [bytes_left] for the transcript scan.
     """
     session_id = str(session_id or "")
     # Capture BEFORE resolving, not as a fallback. A stamp is a record of what
@@ -1006,7 +1043,7 @@ def resolve(session_id: str, transcript: Optional[Path] = None, *,
 
     uuid = recorded_owner(session_id, transcript, budget)
     label = label_for_uuid(uuid, state)
-    if label in (LABEL_PERSONAL, LABEL_WORK):
+    if label and label != LABEL_UNKNOWN:
         return {"label": label, "source": "recorded", "evidence": ""}
 
     stamped = (state.get("stamped") or {}).get(session_id)
@@ -1018,21 +1055,11 @@ def resolve(session_id: str, transcript: Optional[Path] = None, *,
         return {"label": from_backup["label"], "source": "backup",
                 "evidence": from_backup["evidence"]}
 
-    if infer:
-        hint = org_hint(session_id, transcript)
-        if hint:
-            return {"label": hint["label"], "source": "inferred",
-                    "evidence": hint["evidence"]}
-    else:
-        cached = (state.get("inferred") or {}).get(session_id)
-        if isinstance(cached, dict) and cached.get("hint"):
-            return {"label": LABEL_WORK, "source": "inferred",
-                    "evidence": ORG_HINT_EVIDENCE}
 
     return {"label": LABEL_UNKNOWN, "source": "unknown", "evidence": ""}
 
 
-def annotate_row(row: Dict[str, Any], *, infer: bool = False,
+def annotate_row(row: Dict[str, Any], *,
                  attestations: Optional[List[Dict[str, Any]]] = None,
                  budget: Optional[List[int]] = None) -> Dict[str, Any]:
     """Add account_label / account_source / account_evidence to a scan row.
@@ -1047,7 +1074,6 @@ def annotate_row(row: Dict[str, Any], *, infer: bool = False,
             Path(transcript) if transcript else None,
             started_at=row.get("started_at") or row.get("mtime"),
             active=bool(row.get("is_active")),
-            infer=infer,
             attestations=attestations,
             budget=budget)
     except Exception:
@@ -1061,7 +1087,7 @@ def annotate_row(row: Dict[str, Any], *, infer: bool = False,
     return row
 
 
-def annotate_rows(rows: List[Dict[str, Any]], *, infer: bool = False,
+def annotate_rows(rows: List[Dict[str, Any]], *,
                   scan_bytes: Optional[int] = _SCAN_BYTES_PER_PASS
                   ) -> List[Dict[str, Any]]:
     """annotate_row over a listing, reading the backup snapshots once.
@@ -1078,7 +1104,7 @@ def annotate_rows(rows: List[Dict[str, Any]], *, infer: bool = False,
     budget: Optional[List[int]] = None if scan_bytes is None else [int(scan_bytes)]
     for row in rows or []:
         try:
-            annotate_row(row, infer=infer, attestations=attestations, budget=budget)
+            annotate_row(row, attestations=attestations, budget=budget)
         except Exception:
             row.setdefault("account_label", LABEL_UNKNOWN)
             row.setdefault("account_source", "unknown")
@@ -1095,7 +1121,7 @@ def normalise_label(value: Any) -> Optional[str]:
 
     Matches any label this machine actually knows (see known_labels()), plus a
     unique one-letter prefix of it. Never a fixed vocabulary: the labels are
-    allocated per machine and renameable, so hardcoding 'personal'/'work' here
+    allocated per machine and renameable, so hardcoding any fixed names here
     would reject the name the user chose."""
     text = str(value or "").strip().lower()
     if not text:

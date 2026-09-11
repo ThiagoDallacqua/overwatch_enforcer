@@ -531,12 +531,7 @@ class SessionLedger:
 
     @property
     def _account(self) -> Dict[str, Any]:
-        """Which account paid, as {label, source}. Resolved once per ledger.
-
-        infer=False: this runs inside `oe report`/`oe status`, and the org-quota
-        hint costs a full-file scan. A hint already cached by `oe account list`
-        is still honoured, so the report agrees with the listing.
-        """
+        """Which account paid, as {label, source}. Resolved once per ledger."""
         cached = getattr(self, "_account_cache", None)
         if cached is None:
             try:
@@ -3973,6 +3968,21 @@ def _row_from_cache(transcript: Path, newer_than: float = 0.0) -> Optional[Dict[
     }
 
 
+class ScanRows(list):
+    """scan_sessions()'s rows, plus how much of the corpus they cover.
+
+    `found` is how many session transcripts exist; `cap` is scan.max_sessions.
+    When found > cap the rows are the newest `cap` only, and every total built
+    on them -- all-time spend, the account rollup, the dashboard -- is a total
+    over the newest `cap`, which the caller must say out loud. A list subclass
+    so every existing caller keeps working; slicing or filtering returns a plain
+    list, so a caller that filters reads these two first.
+    """
+
+    found: int = 0
+    cap: int = 0
+
+
 def scan_sessions(active_within_seconds: Optional[int] = None, *,
                   cost_budget_bytes: Optional[int] = None) -> List[Dict[str, Any]]:
     """Lightweight row per session across every project, with a real cost.
@@ -4096,13 +4106,14 @@ def scan_sessions(active_within_seconds: Optional[int] = None, *,
     # Which account paid for each of these. Label + provenance only -- the email
     # and the accountUuid stay in accounts' own state file, because these rows
     # are serialised verbatim into sessions.json, which is an artifact.
-    # infer=False: the org-quota hint needs a full-file scan and this is the hot
-    # path; `oe account list` is where that cost is paid.
     try:
-        accounts.annotate_rows(rows, infer=False)
+        accounts.annotate_rows(rows)
     except Exception:
         pass
-    return rows
+    out = ScanRows(rows)
+    out.found = len(candidates)
+    out.cap = max_sessions
+    return out
 
 
 def spend_today(rows: Iterable[Dict[str, Any]]) -> float:
