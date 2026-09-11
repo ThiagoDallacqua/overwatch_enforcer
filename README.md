@@ -7,7 +7,7 @@ handed a slice instead of a whole file.
 
 Python 3.10+, standard library only. No packages, no network, no account.
 
-> **Early development.** `v1.0.2` is the current release and the tool is in real use, but it
+> **Early development.** `v1.0.3` is the current release and the tool is in real use, but it
 > is still moving: command names, flags and the shape of what they print can change between
 > releases. If you need it to stay still, install a tag rather than `main`
 > ([Pinning a version](docs/install.md#pinning-a-version)). Bugs are expected. The exposure is not
@@ -64,9 +64,9 @@ If Claude Code stops with a hook error, repair it from a plain shell:
 
     python3 <checkout>/bin/oe-repair          # names every broken registration
 
-It **diagnoses only** in v1.0.2 and never writes: it prints the entries that
+It **diagnoses only** in v1.0.3 and never writes: it prints the entries that
 point at nothing, quoted line by line, and you remove them by hand. The repair
-path is held back one release because it can delete a registration that is
+path is held back because it can delete a registration that is
 working — see [A hook entry points at a file that is gone](docs/operations.md#a-hook-entry-points-at-a-file-that-is-gone).
 
 `oe repair` runs the same tool. It imports nothing from `oe/`, so it still

@@ -30,8 +30,8 @@ more file that can be missing at the worst moment.
 
 WHY THIS BUILD DOES NOT WRITE
 ----------------------------
-v1.0.0 diagnoses and stops. The repair path is held back for one release
-because it can remove a registration that is WORKING:
+This build diagnoses and stops. The repair path is held back because it can
+remove a registration that is WORKING:
 
   * `$CLAUDE_PROJECT_DIR` and relative hook paths are resolved against
     whichever directory you happen to be standing in, so a hook that works in
