@@ -27,6 +27,7 @@ every failure is logged to a size-capped log, and the loop keeps going.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -1944,12 +1945,17 @@ class Supervisor:
                  report_interval_seconds: Optional[float] = None,
                  max_track_age_seconds: Optional[float] = None,
                  new_session_scan_seconds: Optional[float] = None,
-                 log_path: Optional[Path] = None) -> None:
+                 log_path: Optional[Path] = None,
+                 mode: str = "detached") -> None:
         if reports_root:
             paths.set_reports_root(reports_root)
         config = paths.load_config()
         block = config.get("supervisor") or {}
         self.config = config
+        # 'thread' when it lives inside `oe watch --inline` and dies with it.
+        # Recorded in the pidfile, because a supervisor in that mode must never
+        # be stopped from outside: it would take the view down with it.
+        self.mode = mode if mode in ("detached", "thread") else "detached"
         self.reports_root = paths.reports_root()
 
         def _pick(explicit, key, fallback, top_level=None):
@@ -2102,6 +2108,8 @@ class Supervisor:
                 "started_at": _iso(_now()),
                 "started_epoch": self.started_epoch,
                 "schema": _SUPERVISOR_SCHEMA,
+                "mode": self.mode,
+                "code": code_fingerprint(),
             }, indent=2) + "\n")
         except Exception as exc:
             self.log(f"supervisor pidfile write failed: {exc!r}", "error")
@@ -2872,6 +2880,81 @@ def stop_supervisor(timeout: float = 6.0) -> bool:
     return not _alive(pid)
 
 
+def code_fingerprint() -> str:
+    """A short hash of this package's source as it is on disk right now.
+
+    Content, not VERSION: the version changes only at a release, and main moves
+    between releases. Hashed from the package's own location rather than the
+    install root, because the code that matters is the code actually imported.
+    About a megabyte of source, so a few milliseconds. '' when unreadable, which
+    callers treat as "cannot tell" and never as "changed".
+    """
+    try:
+        root = Path(__file__).resolve().parent
+        digest = hashlib.sha256()
+        for path in sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts):
+            digest.update(str(path.relative_to(root)).encode("utf-8") + b"\0")
+            digest.update(path.read_bytes())
+        return digest.hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _command_line(pid: int) -> List[str]:
+    """argv of a process: /proc where there is one, `ps` otherwise (macOS)."""
+    try:
+        argv = _proc_cmdline(pid)
+    except Exception:
+        argv = []
+    if argv:
+        return argv
+    try:
+        import subprocess
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.split() if out.returncode == 0 else []
+    except Exception:
+        return []
+
+
+def supervisor_out_of_date() -> Optional[str]:
+    """Why the running supervisor should be replaced, or None to leave it be.
+
+    None whenever there is doubt, because the cost of the two mistakes is not
+    symmetric: leaving an old supervisor running is what happened before this
+    existed, while stopping the wrong process kills whatever it was.
+
+    * A supervisor recorded as 'thread' lives inside `oe watch --inline`:
+      never, however old -- stopping it would close that view.
+    * One that recorded its code: replaced when the code on disk differs.
+    * One that recorded neither (started by 1.0.3 or earlier, which is every
+      supervisor running on an upgrading machine): its code is older by
+      definition, but it could be inline, and only its command line can say.
+      '--inline' there, or a command line that cannot be read, means leave it.
+    """
+    try:
+        record = json.loads(supervisor_pidfile().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = _int(record.get("pid"))
+    if not pid or pid < 0 or record.get("mode") == "thread":
+        return None
+    recorded = record.get("code")
+    if recorded:
+        current = code_fingerprint()
+        if current and recorded != current:
+            return "the code on disk changed since it started"
+        return None
+    if record.get("mode"):
+        return None                     # recorded a mode but no code: cannot tell
+    argv = _command_line(pid)
+    if not argv or "--inline" in argv:
+        return None
+    return "it was started by a build that predates code tracking"
+
+
 def ensure_supervisor(reports_root: Optional[str | os.PathLike] = None, *,
                       mode: str = "detached", **kwargs) -> Dict[str, Any]:
     """Make sure exactly one supervisor is running. Never raises.
@@ -2889,14 +2972,31 @@ def ensure_supervisor(reports_root: Optional[str | os.PathLike] = None, *,
         existing = supervisor_running()
     except Exception:
         existing = None
+    # A supervisor keeps executing the code it started with, so after a pull or
+    # an upgrade "one is running" is not the same as "the current one is
+    # running". Replace an out-of-date DETACHED one; never one inside
+    # `oe watch --inline` (supervisor_out_of_date() says None for those).
+    replaced: Dict[str, Any] = {}
+    stale: Optional[str] = None
+    if existing and existing > 0 and mode == "detached":
+        try:
+            stale = supervisor_out_of_date()
+        except Exception:
+            stale = None
+        if stale and stop_supervisor():
+            replaced = {"restarted": True, "previous_pid": existing, "reason": stale}
+            existing = None
     if existing:
-        return {"running": True, "pid": existing if existing > 0 else 0,
-                "started": False, "mode": "existing"}
+        state: Dict[str, Any] = {"running": True, "pid": existing if existing > 0 else 0,
+                                 "started": False, "mode": "existing"}
+        if stale:
+            state["out_of_date"] = stale
+        return state
     if mode == "none":
         return {"running": False, "pid": 0, "started": False, "mode": "none"}
     if mode == "thread":
         import threading
-        supervisor = Supervisor(reports_root, **kwargs)
+        supervisor = Supervisor(reports_root, mode="thread", **kwargs)
         if not supervisor.acquire():
             return {"running": True, "pid": supervisor_running() or 0,
                     "started": False, "mode": "existing"}
@@ -2906,7 +3006,8 @@ def ensure_supervisor(reports_root: Optional[str | os.PathLike] = None, *,
         return {"running": True, "pid": os.getpid(), "started": True,
                 "mode": "thread", "thread": thread, "supervisor": supervisor}
     pid = start_supervisor(reports_root, **kwargs)
-    return {"running": bool(pid), "pid": pid, "started": bool(pid), "mode": "detached"}
+    return {"running": bool(pid), "pid": pid, "started": bool(pid), "mode": "detached",
+            **replaced}
 
 
 def supervisor_status() -> Dict[str, Any]:

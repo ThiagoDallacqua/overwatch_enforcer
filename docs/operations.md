@@ -126,7 +126,8 @@ $OE/bin/oe supervise --ensure
 
 `--ensure` decides the race with a flock, not with the pidfile, so a stale
 `state/supervisor.pid` cannot produce two supervisors. If `--status` reports
-`"running": true` for a pid that no longer exists, `--stop` clears it.
+`"running": true` for a pid that no longer exists, `--stop` clears it. After an update,
+`--ensure` alone replaces a supervisor still running the old code.
 
 ### The context index is wrong or corrupt
 

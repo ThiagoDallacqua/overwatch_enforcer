@@ -32,6 +32,7 @@ Addresses are assembled at runtime on the reserved example domains, so this file
 carries no address-shaped literal for the leak gate to argue with.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -681,6 +682,211 @@ def check_upgrade_swaps_in_only_on_success() -> Tuple[bool, Any]:
     return got == want, got
 
 
+# --- the supervisor -----------------------------------------------------------
+# These start REAL processes, in a sandbox whose state directory -- and so whose
+# supervisor lock -- is a temp dir: a supervisor already running on the machine
+# holds a different lock and cannot be reached. Everything started is stopped in
+# `finally`, and a stand-in that holds the lock is killed there too.
+
+# The stand-in forks away from its launcher, as the real daemon double-forks:
+# a process that stays the checker's own child lingers as a zombie after it is
+# killed, and a zombie still answers kill(pid, 0) -- which would make a correct
+# stop look like a failed one.
+# It writes its pid BEFORE waiting for the lock, so one that never gets it can
+# still be found and killed.
+_LOCK_HOLDER = """
+import fcntl, os, sys, time
+if os.fork():
+    os._exit(0)
+os.setsid()
+with open(sys.argv[2], "w") as note:
+    note.write(str(os.getpid()))
+handle = open(sys.argv[1], "a+")
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+open(sys.argv[2] + ".held", "w").close()
+time.sleep(120)
+"""
+
+
+@contextlib.contextmanager
+def _supervisor_sandbox():
+    with tempfile.TemporaryDirectory() as raw:
+        env, _ = _sandbox(Path(raw), None, 0, {})
+        state = Path(env["OE_STATE_DIR"])
+        holders: List[int] = []
+        try:
+            yield env, state, holders
+        finally:
+            _oe(env, "supervise", "--stop", "--quiet")
+            # The backstop that does not depend on any record: every process
+            # started in this sandbox carries its OE_STATE_DIR, including a
+            # supervisor the code under test started and no pidfile names.
+            _clear_sandbox(state, holders)
+
+
+def _sandbox_pids(state: Path) -> List[int]:
+    """Every live process whose environment points at this sandbox's state dir."""
+    needle = f"OE_STATE_DIR={state}".encode("utf-8")
+    found = []
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            if needle in (entry / "environ").read_bytes().split(b"\0"):
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return [pid for pid in found if pid != os.getpid()]
+
+
+def _clear_sandbox(state: Path, holders: List[int]) -> None:
+    for pid in set(holders) | set(_sandbox_pids(state)):
+        if pid > 0 and _alive(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+            _wait_dead(pid)
+
+
+def _oe(env: Dict[str, str], *argv: str) -> Tuple[int, str]:
+    proc = subprocess.run([sys.executable, str(ROOT / "bin" / "oe"), *argv], env=env,
+                          capture_output=True, text=True, timeout=120)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _pidfile(state: Path) -> Dict[str, Any]:
+    try:
+        record = json.loads((state / "supervisor.pid").read_text(encoding="utf-8"))
+        return record if isinstance(record, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wait_pidfile(state: Path, want: Callable[[Dict[str, Any]], bool],
+                  timeout: float = 15.0) -> Dict[str, Any]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        record = _pidfile(state)
+        if want(record):
+            return record
+        time.sleep(0.2)
+    return _pidfile(state)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _hold_lock(env: Dict[str, str], state: Path, holders: List[int], *argv: str) -> int:
+    """A stand-in supervisor: holds the lock, shows `argv` on its command line,
+    and is nobody's child. Its pid goes into `holders` as soon as it is known,
+    so the sandbox kills it even if it never gets the lock. Returns the pid once
+    the lock is held, 0 if it was not."""
+    note = state / f"holder-{time.time_ns()}.pid"
+    subprocess.run([sys.executable, "-c", _LOCK_HOLDER, str(state / "supervisor.lock"),
+                    str(note), *argv], env=env, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=30)
+    deadline = time.time() + 10
+    pid = 0
+    while time.time() < deadline and not pid:
+        with contextlib.suppress(Exception):
+            text = note.read_text(encoding="utf-8").strip()
+            pid = int(text) if text else 0
+        if not pid:
+            time.sleep(0.05)
+    if not pid:
+        return 0
+    holders.append(pid)
+    held = Path(str(note) + ".held")
+    while time.time() < deadline:
+        if held.exists():
+            return pid
+        time.sleep(0.05)
+    return 0
+
+
+def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+def check_ensure_restarts_a_supervisor_running_old_code() -> Tuple[bool, Any]:
+    """`oe supervise --ensure` replaces a supervisor whose code has changed on
+    disk since it started, instead of reporting it as running.
+
+    Shipped bug: --ensure only ever started one when none was up, so after a
+    `git pull` the documented update line left the old supervisor running the
+    old code -- and install.md said that line was what reached it.
+    """
+    with _supervisor_sandbox() as (env, state, _holders):
+        _, first_out = _oe(env, "supervise", "--ensure")
+        first = _wait_pidfile(state, lambda r: bool(r.get("pid")))
+        pid1 = first.get("pid")
+        if not pid1:
+            return False, {"did_not_start": first_out.strip()}
+        record = dict(first)
+        record["code"] = "0" * 16          # what a supervisor from older code carries
+        (state / "supervisor.pid").write_text(json.dumps(record), encoding="utf-8")
+        _, second_out = _oe(env, "supervise", "--ensure")
+        second = _wait_pidfile(state, lambda r: bool(r.get("pid")) and r.get("pid") != pid1)
+        ok = ("restarted" in second_out and second.get("pid") not in (None, pid1)
+              and not _alive(pid1) and second.get("code") not in (None, "0" * 16))
+        return ok, {"second": second_out.strip(), "pid1": pid1, "pid2": second.get("pid"),
+                    "old_alive": _alive(pid1)}
+
+
+def check_ensure_restarts_a_legacy_detached_supervisor() -> Tuple[bool, Any]:
+    """A supervisor started by a build that recorded neither its mode nor its
+    code -- 1.0.3 and earlier -- is replaced when its command line shows it is
+    a detached daemon. That is the supervisor every upgrading machine has."""
+    with _supervisor_sandbox() as (env, state, holders):
+        pid = _hold_lock(env, state, holders, "supervise", "--ensure")
+        if not pid:
+            return False, "stand-in did not take the lock"
+        (state / "supervisor.pid").write_text(json.dumps({"pid": pid}), encoding="utf-8")
+        _, out = _oe(env, "supervise", "--ensure")
+        after = _wait_pidfile(state, lambda r: bool(r.get("pid")) and r.get("pid") != pid)
+        stopped = not _alive(pid)
+        ok = "restarted" in out and stopped and after.get("pid") not in (None, pid)
+        return ok, {"out": out.strip(), "stand_in_stopped": stopped, "new_pid": after.get("pid")}
+
+
+def check_ensure_never_kills_an_inline_supervisor() -> Tuple[bool, Any]:
+    """A supervisor running inside `oe watch --inline` is left alone however
+    old its code, because stopping it would kill the view it lives in -- whether
+    its record says so, or only its command line does (a pre-tracking record)."""
+    seen: Dict[str, Any] = {}
+    with _supervisor_sandbox() as (env, state, holders):
+        for label, argv, extra in (("recorded", ("watch",), {"mode": "thread", "code": "0" * 16}),
+                                   ("legacy", ("watch", "--inline"), {})):
+            pid = _hold_lock(env, state, holders, *argv)
+            if not pid:
+                return False, f"{label}: stand-in did not take the lock"
+            (state / "supervisor.pid").write_text(json.dumps({"pid": pid, **extra}),
+                                                  encoding="utf-8")
+            _, out = _oe(env, "supervise", "--ensure")
+            alive = _alive(pid)
+            replacement = None
+            if not alive:
+                record = _wait_pidfile(state, lambda r: bool(r.get("pid")) and r.get("pid") != pid,
+                                       timeout=5)
+                replacement = record.get("pid")
+            seen[label] = {"alive": alive, "replaced_by": replacement, "out": out.strip()}
+            # Wipe the sandbox between rounds -- stand-in, and anything that
+            # replaced it -- so the next round starts with the lock free.
+            _clear_sandbox(state, holders)
+            with contextlib.suppress(OSError):
+                (state / "supervisor.pid").unlink()
+    ok = all(v["alive"] and not v["replaced_by"] and "already running" in v["out"]
+             for v in seen.values())
+    return ok, seen
+
+
 def check_legacy_config_pin_maps_to_primary() -> Tuple[bool, Any]:
     """The old `accounts.personal_email` key still means 'this one is primary',
     and every other address is allocated around it instead of becoming 'work'."""
@@ -804,6 +1010,9 @@ CHECKS: List[Callable[[], Tuple[bool, Any]]] = [
     check_login_an_old_build_adds_later_gets_one_name,
     check_mixed_case_map_key_is_one_login,
     check_upgrade_swaps_in_only_on_success,
+    check_ensure_restarts_a_supervisor_running_old_code,
+    check_ensure_restarts_a_legacy_detached_supervisor,
+    check_ensure_never_kills_an_inline_supervisor,
     check_legacy_config_pin_maps_to_primary,
     check_scan_reports_what_the_cap_dropped,
     check_sessions_footer_names_its_scope,
