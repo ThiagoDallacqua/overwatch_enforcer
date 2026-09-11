@@ -165,6 +165,17 @@ def main() -> None:
     except Exception:
         pass
 
+    # Refresh the rolling agent-read prior. It belongs HERE rather than in the
+    # spawn hook that consumes it: this hook already has a budget and already
+    # touches transcripts, whereas its consumer runs on the tool-call path where
+    # a slow scan would be a correctness problem. Costs no tokens -- it is local
+    # file I/O over transcripts Claude Code has already written.
+    try:
+        from oe import prior as prior_mod
+        prior_mod.write()
+    except Exception:
+        pass
+
 
 def _on_alarm(signum, frame):
     raise _Deadline()

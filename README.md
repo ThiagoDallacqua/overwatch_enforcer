@@ -87,7 +87,14 @@ fresh clone with no setup.
 |---|---|---|---|
 | `SessionStart` | `session_start.py` | 15s | create the session's report directory, record start metadata, start the per-session watcher, and hand the model a one-line retrieval hint |
 | `UserPromptSubmit` | `user_prompt_submit.py` | 10s | put a compact budget line on screen, and into the model's context |
-| `SessionEnd` | `session_end.py` | 180s | the full synchronous report rebuild |
+| `SessionEnd` | `session_end.py` | 180s | the full synchronous report rebuild, and refresh the agent-read prior |
+
+A fourth hook ships but is **not registered unless you ask for it**. `PreToolUse`, matched on
+`Agent`, hands a spawning subagent a context brief — see
+[The spawn brief](docs/commands.md#the-spawn-brief-off-by-default). It is off by default
+because it is the only hook here that runs on a tool-call path, and because it pays only in
+some usage regimes. Set `brief.enabled` in `config.json` and re-run `install.py --yes` to
+switch it on; set it back to false and re-run to remove it.
 
 Every hook wraps its body in try/except and **fails open**: it always exits 0, so a fault in
 this tool can never block a Claude Code session.

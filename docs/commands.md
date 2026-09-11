@@ -243,6 +243,43 @@ a minority of the files an agent goes on to read, and for a prompt with no real 
 still return whatever the index ranked highest. Read the output before trusting it. This is the
 reason the brief is inspectable as a command at all rather than only ever being injected.
 
+### The spawn brief (off by default)
+
+`oe brief` shows what would be injected. This is the hook that would inject it: `PreToolUse`,
+matched on `Agent`, so it fires when a subagent is spawned and at no other time.
+
+**It is off unless you switch it on.** `install.py` registers it only when `config.json` has
+`brief.enabled` true. To remove it, set that back to false and re-run `install.py --yes`: the
+entry is then dropped by the ordinary retirement path. Do **not** delete `hooks/agent_spawn.py`
+while it is still registered — a `PreToolUse` entry pointing at a missing script breaks every
+tool call in every session on the machine, with an error that names the hook rather than
+whoever removed it. Unregister first, confirm no settings file still references it, then delete.
+
+| key | default | what it does |
+|---|---|---|
+| `brief.enabled` | `false` | whether `install.py` registers the hook at all |
+| `brief.budget_tokens` | `1500` | ceiling on the injected text |
+| `brief.gate_threshold` | `0.35` | how read-heavy recent agents must be before a brief is paid for |
+
+**Why there is a gate.** A brief is resident for the spawned agent's whole life and re-billed on
+every request it makes, so it is worth paying for only when that agent is going to read a lot.
+Whether it will was measured against this machine's own history: prompt shape does not predict
+it — pooled it looks predictive and stratified by period it collapses to noise — but **recent
+agent behaviour does**, by roughly an order of magnitude. So the gate reads a rolling figure of
+how much the last few finished agents actually read, and fails CLOSED on every doubt: no prior
+recorded, no agents to measure, a prior older than six hours, or a rate below the threshold all
+mean no injection.
+
+That figure is computed by `SessionEnd`, which already parses transcripts, and cached in
+`state/`. The hook only reads it. Nothing about the gate costs tokens — it is local file I/O
+over transcripts Claude Code has already written. The only thing here that costs tokens is the
+brief itself, and the gate exists to decide when not to pay for it.
+
+The hook never denies a spawn and never emits `permissionDecision`; it writes `updatedInput` or
+nothing. Every path exits 0. Every decision is journalled to `state/` — **refusals included, and
+with the rate each was refused at**, because retuning the gate needs the refusals more than the
+injections: a file holding only what was paid for is a numerator with no denominator.
+
 ### `oe index [roots…]`
 
 Incremental: only files whose mtime or size changed. With no argument it re-scans the roots of
