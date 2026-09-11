@@ -499,18 +499,18 @@ warning naming that, and still exits 0, because an idempotent second uninstall m
 
 ```sh
 $ oe version
-1.0.3
+1.0.4
 
 $ oe version --json
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "commit": null,
   "dirty": null
 }
 ```
 
 In a checkout with history it appends the short commit, and `dirty` when the working tree has
-uncommitted edits — `1.0.3 (abc1234)` and `1.0.3 (abc1234, dirty)` are different bug reports.
+uncommitted edits — `1.0.4 (abc1234)` and `1.0.4 (abc1234, dirty)` are different bug reports.
 Anywhere with no `.git`, including a tarball install, it degrades silently to the bare
 version. The commit is only reported when the repository it comes from **is this tree**, so a
 checkout sitting inside somebody else's repository never prints that repository's commit into
@@ -525,7 +525,7 @@ without asking. A tag does not move.
 
 ```sh
 # a tag, as a checkout: `oe --version` reports the commit, and you can move later
-git clone --branch v1.0.3 https://github.com/ThiagoDallacqua/overwatch_enforcer
+git clone --branch v1.0.4 https://github.com/ThiagoDallacqua/overwatch_enforcer
 cd overwatch_enforcer && python3 install.py
 
 # to move to a later tag rather than to the tip of main
@@ -533,7 +533,7 @@ cd $OE && git fetch --tags && git checkout v1.1.0 && python3 install.py --yes
 ```
 
 `--branch` takes a tag as well as a branch and detaches HEAD at it, so `git status` will say
-`HEAD detached at v1.0.3`. That is expected. **Do not add `--depth 1` unless the checkout is
+`HEAD detached at v1.0.4`. That is expected. **Do not add `--depth 1` unless the checkout is
 disposable** — git implies `--single-branch` with it, so the clone holds only the history
 behind that one tag, `git checkout main` and any other tag both fail in it, and the fix is to
 re-clone.
@@ -542,8 +542,8 @@ The other route is the Release asset — the leak-scanned bundle `oe package` bu
 no git:
 
 ```sh
-gh release download v1.0.3 --repo https://github.com/ThiagoDallacqua/overwatch_enforcer --pattern '*.tar.gz'
-tar xzf overwatch-enforcer-1.0.3.tar.gz
+gh release download v1.0.4 --repo https://github.com/ThiagoDallacqua/overwatch_enforcer --pattern '*.tar.gz'
+tar xzf overwatch-enforcer-1.0.4.tar.gz
 cd overwatch-enforcer && python3 install.py
 ```
 
