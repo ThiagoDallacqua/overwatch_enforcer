@@ -10,7 +10,7 @@
     oe open  [sid|--last]   open that report in a browser
     oe path  [sid|--last]   just print where it is (stable from the session id)
     oe supervise --ensure   start the background writer if it is not up
-    oe sessions             table of recent sessions
+    oe sessions             table of sessions, most recent first (40 unless --limit)
     oe dashboard            rebuild the cross-session index.html
     oe backfill             build reports for past transcripts
     oe doctor               health check; exits 0 when the primary path is fine
@@ -223,7 +223,10 @@ def c(text: str, code: str, enabled: Optional[bool] = None) -> str:
 
 DIM = "38;5;244"
 BOLD = "1"
-WHITE = "38;5;255"
+# Emphasis in the terminal's own foreground, bolded. A fixed 256-colour white
+# vanished on light themes; this palette cannot know which one it is drawn on,
+# so the one colour that must always read is the terminal's own.
+STRONG = BOLD
 BLUE = "38;5;111"
 CYAN = "38;5;80"
 GREEN = "38;5;114"
@@ -498,12 +501,34 @@ def rule(width: int, label: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
+# How much of the corpus the last scan covered. Module state rather than a row
+# attribute because every filter below builds a new list, and "these are only
+# the newest N" stays true of any subset of a capped scan.
+_SCAN_SCOPE: Dict[str, Any] = {"found": 0, "cap": None}
+
+
 def _rows(active_within: Optional[int] = None) -> List[Dict[str, Any]]:
     try:
-        return ledger_mod.scan_sessions(active_within_seconds=active_within)
+        rows = ledger_mod.scan_sessions(active_within_seconds=active_within)
     except Exception as exc:  # a broken corpus must not kill the CLI
         print(c(f"scan failed: {exc}", RED), file=sys.stderr)
         return []
+    _SCAN_SCOPE["found"] = int(getattr(rows, "found", len(rows)) or len(rows))
+    _SCAN_SCOPE["cap"] = getattr(rows, "cap", None)
+    return rows
+
+
+def _scan_capped() -> bool:
+    cap = _SCAN_SCOPE.get("cap")
+    return bool(cap) and int(_SCAN_SCOPE.get("found") or 0) > int(cap)
+
+
+def _scan_scope_note() -> str:
+    """The sentence every total over a capped scan owes its reader, or ''."""
+    if not _scan_capped():
+        return ""
+    return (f"covers the newest {_SCAN_SCOPE['cap']} of {_SCAN_SCOPE['found']} sessions -- "
+            "older ones are not counted; raise scan.max_sessions in config.json to include them")
 
 
 # Colours are keyed by ROLE, not by a fixed set of names: labels are allocated
@@ -528,9 +553,9 @@ def account_cell(row: Dict[str, Any], width: int = 10) -> str:
     """The label, coloured, with a '?' when the provenance is only a guess.
 
     Never the address -- that is PII and stays in state. The mark is a
-    character, not just a colour, so it survives a pipe: 'work' inferred from a
-    heuristic and 'work' read out of a transcript are different claims and the
-    column has to say which one it is showing.
+    character, not just a colour, so it survives a pipe: 'primary' bracketed by a
+    config snapshot and 'primary' read out of a transcript are different claims
+    and the column has to say which one it is showing.
     """
     label = str(row.get("account_label") or "unknown")
     guess = accounts_mod.is_guess(row.get("account_source"))
@@ -813,7 +838,7 @@ def cmd_status(args) -> int:
                  else ("reported" if totals.get("cost_fully_reported") else "mixed"))
     _cost_est = _cost_src != "reported" and bool(totals.get("calls"))
     print("  " + c(money(authoritative, estimate=_cost_est), BOLD) + c("  total", DIM)
-          + c(f"   {humanize_tokens(totals['total_tokens'])} tokens", WHITE)
+          + c(f"   {humanize_tokens(totals['total_tokens'])} tokens", STRONG)
           + c(f"   {totals['calls']} API calls", DIM)
           + c(f"   {session['turns']} turns", DIM)
           + c(f"   {duration(session['wall_seconds'])} wall", DIM))
@@ -842,7 +867,7 @@ def cmd_status(args) -> int:
           + c(f" {pct:5.1f}%", pct_color(pct))
           + c(f"  {humanize_tokens(window.get('used_tokens'))} / "
               f"{humanize_tokens(window.get('max_tokens'))}", DIM)
-          + c(f"  {pricing.display_name(window.get('model'))}", WHITE))
+          + c(f"  {pricing.display_name(window.get('model'))}", STRONG))
 
     growth = data.get("context_growth") or {}
     if growth.get("turns_until_full") is not None:
@@ -1282,6 +1307,11 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "today_usd": ledger_mod.spend_today(rows),
         "today_estimate": any(r.get("cost_is_estimate") for r in today_rows),
         "all_usd": all_time,
+        # A capped scan holds the newest N sessions only, so "all-time" would
+        # be false. Every total built on the scan inherits the cap.
+        "capped": _scan_capped(),
+        "found": _SCAN_SCOPE.get("found"),
+        "cap": _SCAN_SCOPE.get("cap"),
         "all_estimate": any(r.get("cost_is_estimate") for r in rows),
         # A sum over SOME rows must never be captioned with the count of ALL of
         # them. On a cold cache the scan defers the biggest sessions, so a header
@@ -1332,7 +1362,7 @@ def _watch_frame(rows: List[Dict[str, Any]], width: int, height: int,
     # --- header: tokens / dollars in flight, then today and all-time ---------
     title_bar = (c(" Overwatch Enforcer ", "48;5;25;38;5;231;1")
                  + c(f" {spinner} ", GREEN if active else GREY)
-                 + c(f"{agg['open']} open", WHITE if active else DIM)
+                 + c(f"{agg['open']} open", STRONG if active else DIM)
                  + c(f"  ·  {now}  ·  every {interval:g}s", DIM)
                  # An unlabelled filtered pane reads as the whole machine: every
                  # figure below is a sum over this subset only.
@@ -1344,17 +1374,18 @@ def _watch_frame(rows: List[Dict[str, Any]], width: int, height: int,
         + c(" / ", DIM)
         + c(money(agg["live_usd"], estimate=agg["live_estimate"]), GREEN if active else DIM)
         + c(" in flight", DIM),
-        c(f"    {money(agg['today_usd'], estimate=agg['today_estimate'])}", WHITE)
+        c(f"    {money(agg['today_usd'], estimate=agg['today_estimate'])}", STRONG)
         + c(" today", DIM),
-        c(f"    {money(agg['all_usd'], estimate=agg['all_estimate'])}", WHITE)
-        + c(" all-time", DIM)
+        c(f"    {money(agg['all_usd'], estimate=agg['all_estimate'])}", STRONG)
+        + (c(" all-time", DIM) if not agg["capped"] else
+           c(f" across the newest {agg['cap']} of {agg['found']} sessions", AMBER))
         # Welded to the number, NOT a trailing segment: _fit_segments drops from
         # the end, so a caption kept separate is the first thing a narrow pane
         # throws away -- and the one moment it must not is a cold cache, when
         # the number it qualifies is the one that is short.
         + (c(f" ({agg['sessions']}/{agg['sessions_total']} priced)", AMBER)
            if agg["unpriced"] else ""),
-        c("" if agg["unpriced"] else f" ({agg['sessions']} sessions)", GREY),
+        c("" if agg["unpriced"] or agg["capped"] else f" ({agg['sessions']} sessions)", GREY),
     ], width))
     lines.append("")
 
@@ -1411,7 +1442,7 @@ def _watch_frame(rows: List[Dict[str, Any]], width: int, height: int,
             model_cost = money(current.get("cost_usd"), estimate=estimate)
             lines.append("    " + c(pricing.display_name(current.get("model")), MAGENTA + ";1")
                          + (c(f" {flags}", MAGENTA) if flags else "")
-                         + c(" · ", GREY) + c(model_cost, WHITE)
+                         + c(" · ", GREY) + c(model_cost, STRONG)
                          + c(" · ", GREY) + c(f"{int(current.get('calls') or 0):,} calls", DIM))
         else:
             lines.append("    " + c(pricing.display_name(row.get("model")), MAGENTA + ";1")
@@ -1428,7 +1459,7 @@ def _watch_frame(rows: List[Dict[str, Any]], width: int, height: int,
         # line 4 -- context window
         lines.append("    " + bar(pct, bar_width)
                      + c(f" {pct:5.1f}%", pct_color(pct))
-                     + c(f"  {humanize_tokens(used)}/{humanize_tokens(maximum)}", WHITE)
+                     + c(f"  {humanize_tokens(used)}/{humanize_tokens(maximum)}", STRONG)
                      + c(" context", DIM))
         lines.append("")
 
@@ -1456,7 +1487,7 @@ def _watch_frame(rows: List[Dict[str, Any]], width: int, height: int,
                      if show_bar else "")
             lines.append("  " + c(short_sid(row["session_id"]), DIM)
                          + " " + c(clip(private(row.get("title")) or paths.project_display(
-                             row.get("project") or ""), name_width).ljust(name_width), WHITE)
+                             row.get("project") or ""), name_width).ljust(name_width), STRONG)
                          + meter
                          + c(f" {row_money(row):>11}", DIM)
                          + c(f" {ago(row.get('mtime')):>9}", DIM))
@@ -1488,10 +1519,10 @@ def _watch_footer(rows: List[Dict[str, Any]], width: int,
         c(head, AMBER if warn else GREY) + c("─" * max(0, width - 2 - len(head)), GREY),
         "  " + c(clip_left(str(target), width - 4), DIM),
         _fit_segments([
-            "  " + c("q", WHITE) + c(" quit  ", DIM) + c("r", WHITE) + c(" refresh", DIM),
-            c("  o", WHITE) + c(" report", DIM),
-            c("  d", WHITE) + c(" dashboard", DIM),
-            c("  ?", WHITE) + c(" help", DIM),
+            "  " + c("q", STRONG) + c(" quit  ", DIM) + c("r", STRONG) + c(" refresh", DIM),
+            c("  o", STRONG) + c(" report", DIM),
+            c("  d", STRONG) + c(" dashboard", DIM),
+            c("  ?", STRONG) + c(" help", DIM),
         ], width),
     ]
 
@@ -1985,8 +2016,8 @@ def cmd_sessions(args) -> int:
     width, _ = term_size()
     # ACCOUNT is 10 columns wide, so the title gives up 10 -- the table already
     # sizes itself off the terminal and must not start wrapping because of it.
-    # Ten, not nine: the widest cell this column can hold is 'personal?', the
-    # guess mark included, and at nine that would touch the MODEL column.
+    # Ten, not nine: the widest common cell is 'secondary?', the guess mark
+    # included, and at nine that would touch the MODEL column.
     title_width = max(16, min(40, width - 86))
     # A pseudonym ('session_01') is two columns wider than an id prefix
     # ('718293a4'), and it is the pseudonym that joins this row to its report
@@ -2023,17 +2054,27 @@ def cmd_sessions(args) -> int:
               f"{_calls_text(row):>6}{row_money(row):>11}  "
               + bar(pct, 10) + c(f"{pct:5.1f}%", pct_color(pct))
               + f"{ago(row.get('mtime')):>11}")
-    # Both figures are computed over the rows actually PRINTED, so a --limit /
-    # --days / --active filter must say so rather than let "$N today" read
-    # as the whole day.
-    scope = "" if len(rows) == scanned else " (listed rows only)"
+    # Both figures are computed over the rows actually PRINTED, and the count
+    # LEADS with that scope: "N sessions" at the head of the line reads as a
+    # total whatever follows it, and a narrow pane drops the tail first.
+    found = max(scanned, int(_SCAN_SCOPE.get("found") or 0))
+    if len(rows) < found:
+        head = f"{len(rows)} of {found} sessions shown, most recent first"
+        scope = " (totals cover the rows shown)"
+    else:
+        head = f"{len(rows)} sessions"
+        scope = ""
     if getattr(args, "account", None):
         scope += f" [account: {accounts_mod.normalise_label(args.account)}]"
     # "N sessions, $X total" reads as a total over ALL N when some of them
     # were not priced this pass; name what the sum actually covers.
     covers = "" if not unknown else f" across {len(rows) - unknown} of them"
-    footer = (f"\n  {len(rows)} sessions, {money(total)} total{covers}, "
+    footer = (f"\n  {head}, {money(total)} total{covers}, "
               f"{money(ledger_mod.spend_today(rows), estimate=True)} today{scope}")
+    if args.limit and len(rows) == args.limit and scanned > args.limit:
+        footer += f"\n  --limit {args.limit} shows the newest {args.limit}; --limit 0 lists all {scanned}"
+    if _scan_capped():
+        footer += "\n  " + _scan_scope_note()
     if unknown:
         # NOT "no cost-state on disk" -- that is a false diagnosis. A session
         # with cost-state lines still lands here, because the reason is always
@@ -2120,7 +2161,8 @@ def _split_target(target: Optional[List[str]]) -> Tuple[Optional[str], List[str]
     rest: List[str] = []
     for token in list(target or []):
         found = accounts_mod.normalise_label(token)
-        if found in (accounts_mod.LABEL_PERSONAL, accounts_mod.LABEL_WORK) and label is None:
+        if found in accounts_mod.known_labels() and found != accounts_mod.LABEL_UNKNOWN \
+                and label is None:
             label = found
             continue
         rest.append(token)
@@ -2165,11 +2207,12 @@ def cmd_account(args) -> int:
         return 0
 
     if action == "list":
-        # infer=True only here: the org-quota hint costs a full-file scan, and
-        # this is the one command whose job is to explain the labels.
+        # An unlimited byte budget only here: this is the one command whose job
+        # is to explain the labels, so it reads every transcript's owner record
+        # rather than the slice a hot path can afford.
         rows = _rows()
         try:
-            accounts_mod.annotate_rows(rows, infer=True, scan_bytes=None)
+            accounts_mod.annotate_rows(rows, scan_bytes=None)
         except Exception as exc:
             print(c(f"account resolution failed: {exc}", RED), file=sys.stderr)
         rows = apply_account_filter(rows, getattr(args, "account", None))
@@ -2193,6 +2236,8 @@ def cmd_account(args) -> int:
         print()
         for line in _account_rollup_lines(rows, width):
             print(line)
+        if _scan_capped():
+            print("  " + c(_scan_scope_note(), AMBER))
         print()
         print(rule(width, "provenance"))
         counts = accounts_mod.provenance_counts(rows)
@@ -2203,7 +2248,7 @@ def cmd_account(args) -> int:
         for name, count in counts.items():
             if not count:
                 continue
-            print("  " + c(f"{name:<10}", WHITE)
+            print("  " + c(f"{name:<10}", STRONG)
                   + f"{count:>4} session(s)  " + bar(100.0 * count / total, 24, colour=False)
                   + c(f"  {_SOURCE_MEANING.get(name, '')}", DIM))
         evidence = [r for r in rows if r.get("account_evidence")]
@@ -2211,7 +2256,7 @@ def cmd_account(args) -> int:
             print()
             print("  " + c("evidence for the low-confidence labels:", DIM))
             for row in evidence:
-                print("  " + c(short_sid(row["session_id"]), WHITE)
+                print("  " + c(short_sid(row["session_id"]), STRONG)
                       + c(f"  {row.get('account_label')} via {row.get('account_source')}", DIM))
                 for line in _wrap(str(row.get("account_evidence")), width - 8):
                     print("      " + c(line, DIM))
@@ -2249,7 +2294,7 @@ def cmd_account(args) -> int:
             print(f"  {mark} {short_sid(change['session_id'])}  "
                   + c(f"{change['before']} ({change['before_source']})", DIM)
                   + c(f"  ->  {label} (assigned)" if change["changed"] else "  already assigned",
-                      WHITE if change["changed"] else GREY)
+                      STRONG if change["changed"] else GREY)
                   + c(f"   {clip(private(row.get('title')), 40)}", DIM))
         if args.dry_run:
             print(c("\n  --dry-run: nothing was written", AMBER))
@@ -2296,8 +2341,8 @@ _SOURCE_MEANING = {
     "recorded": "the transcript's own bridge-session ownerAccountUuid",
     "stamped": "captured live from the logged-in account while it ran",
     "backup": "a ~/.claude/backups snapshot window brackets its start",
-    "inferred": "a low-confidence hint; see the evidence below",
-    "unknown": "nothing on disk names an account for it",
+    "unknown": "no record names an account -- usually it ran before oe was installed; "
+               "`oe account assign` sets it",
 }
 
 
@@ -2944,7 +2989,7 @@ def cmd_doctor(args) -> int:
         print("      " + c("adds a cost/context row inside the Claude Code window; it is the "
                            "one", DIM))
         print("      " + c("feature that cannot work without a settings.json key.", DIM))
-        print("      " + c(f"preview the exact diff:  {INSTALL_STATUSLINE_COMMAND}", WHITE))
+        print("      " + c(f"preview the exact diff:  {INSTALL_STATUSLINE_COMMAND}", STRONG))
         print("      " + c(f"then apply it with:      {INSTALL_STATUSLINE_COMMAND} --yes", DIM))
 
     print()
@@ -2976,7 +3021,7 @@ def cmd_doctor(args) -> int:
     if broken_hooks:
         print("      " + c(f"repair it from a plain shell (Claude Code cannot fix "
                            f"this from inside):", AMBER))
-        print("      " + c(f"python3 {INSTALL_ROOT}/bin/oe-repair", WHITE)
+        print("      " + c(f"python3 {INSTALL_ROOT}/bin/oe-repair", STRONG)
               + c("        (diagnoses; v1.0.0 never writes)", DIM))
     if wired:
         state = paths.state_dir()
@@ -3235,7 +3280,7 @@ def cmd_install_statusline(args) -> int:
     code = _run_installer(argv)
     if code == 0 and not args.yes and not _INSTALLER_NOOP:
         print(c(f"  Nothing was written. Apply it with:", AMBER))
-        print("      " + c(f"{INSTALL_STATUSLINE_COMMAND} --yes", WHITE))
+        print("      " + c(f"{INSTALL_STATUSLINE_COMMAND} --yes", STRONG))
         print(c(f"  Undo at any time with: {UNINSTALL_STATUSLINE_COMMAND}", DIM))
     elif code == 0 and args.yes:
         print()
@@ -3257,7 +3302,7 @@ def cmd_uninstall_statusline(args) -> int:
     code = _run_installer(argv)
     if code == 0 and not args.yes and not _INSTALLER_NOOP:
         print(c("  Nothing was written. Apply it with:", AMBER))
-        print("      " + c(f"{UNINSTALL_STATUSLINE_COMMAND}", WHITE))
+        print("      " + c(f"{UNINSTALL_STATUSLINE_COMMAND}", STRONG))
     return code
 
 

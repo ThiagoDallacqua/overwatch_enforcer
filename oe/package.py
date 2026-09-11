@@ -155,6 +155,7 @@ TREES: Dict[str, Optional[frozenset]] = {
     ".github": frozenset({
         "scripts/canary_leaks.py",
         "scripts/leak_gate.py",
+        "scripts/regressions.py",
         "scripts/sweep.py",
         "workflows/ci.yml",
         "workflows/release.yml",

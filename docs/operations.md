@@ -45,8 +45,9 @@ bytes and error counts and says *no timing* on every session, installed or not.
 context window* opening the file for the first time, which nothing can recover. The `windows`
 column is what separates the two; read it before you treat a row as money on the table.
 
-**Account attribution is only certain where a bridge-session record exists.** `recorded` is a
-record; `inferred` is a hint printed with its evidence; `unknown` is honest.
+**Account attribution is only certain where a record exists.** `recorded` and `stamped` are
+records; `backup` is circumstantial and marked so; `unknown` is honest — and on a new install
+it covers most of history, because a session can only be stamped while it is running.
 
 **Compaction is approximate.** There is no snapshot of the context immediately before a
 compaction; what the transcript records is used, and nothing more precise is claimed.

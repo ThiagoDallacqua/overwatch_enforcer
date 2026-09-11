@@ -61,7 +61,8 @@ destroy the exact-match lookup:
 | anyone else's `/home/x`, `/Users/x` | `/home/<user>`, `/Users/<user>` |
 | the username as a bare token, anywhere (`<name>-laptop`) | `<user>` |
 | the hostname, and its short form | `<host>` |
-| an email address | the account **label** only (`<account:primary>`) |
+| an email address of one of your logins | the account **label** only (`<account:primary>`) |
+| any other email address | a short one-way hash (`<email-1a2b3c4d>`); the address is never stored |
 | a session uuid | its report pseudonym (`session_07`), or a stable short hash |
 | a truncated session id in a table cell | its pseudonym |
 | a branch name (`feature/…`, `fix/…`, `hotfix/…`, `chore/…`, `release/…`, `bugfix/…`) | `<branch>` |

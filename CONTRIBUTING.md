@@ -37,6 +37,7 @@ CI asserts the tracked list separately for that reason.
 python3 -m compileall -q -f oe hooks install.py extract_pricing.py
 python3 install.py --check --allow-missing-claude
 python3 .github/scripts/leak_gate.py
+python3 .github/scripts/regressions.py
 oe package --dir            # run this one locally; see below
 ```
 

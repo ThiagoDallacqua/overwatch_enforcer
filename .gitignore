@@ -127,6 +127,7 @@ bin/*
 .github/scripts/*
 !.github/scripts/canary_leaks.py
 !.github/scripts/leak_gate.py
+!.github/scripts/regressions.py
 !.github/scripts/sweep.py
 
 # ---------------------------------------------------------------------------

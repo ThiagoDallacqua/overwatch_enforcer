@@ -389,6 +389,19 @@ def _safe_ticket_shapes() -> frozenset:
     return frozenset(safe)
 
 
+# The names accounts.allocate_label() gives a third and later login. They are
+# issue-key shaped by construction ('secondary-2'), and scrubbing them turned the
+# one message that lists the labels you may type into a row of '<ticket>'s. A
+# PATTERN, not a lookup of this machine's labels: the leak gate runs in CI with
+# no state at all, so its verdict must not depend on which machine runs it --
+# and deciding it must not read the state file, let alone write it.
+_ALLOCATED_LABEL_RE = re.compile(r"secondary-\d{1,6}", re.I)
+
+
+def _is_allocated_label(value: str) -> bool:
+    return bool(_ALLOCATED_LABEL_RE.fullmatch(str(value or "")))
+
+
 def audit(text_or_obj: Any, *, where: str = "") -> List[Finding]:
     """Scan a string (or any JSON-serialisable object) for personal data.
 
@@ -427,9 +440,11 @@ def audit(text_or_obj: Any, *, where: str = "") -> List[Finding]:
     for match in _TICKET_RE.finditer(text):
         value = match.group(0)
         start = match.start()
-        # ONLY two things are downgraded: an exact value from the pricing
-        # catalog ('opus-5' inside claude-opus-5) plus 'utf-8', and a CSS custom
-        # property, which is the '--' double hyphen.
+        # ONLY three things are downgraded: an exact value from the pricing
+        # catalog ('opus-5' inside claude-opus-5) plus 'utf-8', a CSS custom
+        # property, which is the '--' double hyphen, and an allocated account
+        # label ('secondary-2'), matched by pattern so the verdict is the same on
+        # every machine.
         #
         # A looser rule -- "preceded by any single '-'" -- is a bypass, not a
         # heuristic: 'fix-abc-913-verifier', which is the shape of a branch
@@ -438,7 +453,8 @@ def audit(text_or_obj: Any, *, where: str = "") -> List[Finding]:
         # report.html and summary.md.
         css_property = start > 1 and text[start - 1] == "-" and text[start - 2] == "-"
         model_id = _model_prefixed(text, start)
-        severity = ("review" if (css_property or model_id or value.lower() in safe)
+        severity = ("review" if (css_property or model_id or value.lower() in safe
+                                 or _is_allocated_label(value))
                     else "block")
         findings.append(Finding("ticket", severity, start, value, where))
 
@@ -1705,17 +1721,23 @@ def _hash_token(kind: str, value: str) -> str:
 
 
 def _account_token(address: str) -> str:
-    """An email becomes its ACCOUNT LABEL and nothing else -- 'primary',
-    'work', whatever this machine calls it. The label is the useful part
-    (which account was this?); the address is the part that identifies a human.
+    """An address of one of THIS machine's logins becomes its account label;
+    any other address becomes a short hash.
+
+    Lookup, never allocation. Asking for a label used to allocate one, so a
+    colleague's address in a transcript became one of YOUR accounts
+    ('<account:secondary>'), was written to state, and pushed the next real
+    login down to secondary-N. An address this machine never logged in with is
+    not an account, and a shareable document must not say it is.
     """
     try:
         from . import accounts  # lazy: accounts imports this module
-        label = accounts.label_for_email(address)
+        label = accounts.known_label_for_email(address)
     except Exception:
-        label = ""
-    label = str(label or "").strip() or "unknown"
-    return f"<account:{label}>"
+        label = None
+    if label:
+        return f"<account:{label}>"
+    return _hash_token("email", address)
 
 
 def _scrub_rules() -> List[Tuple[Any, Any]]:
@@ -1848,7 +1870,9 @@ def _scrub_rules() -> List[Tuple[Any, Any]]:
         # that fires about it could not name the model it was warning about.
         if _model_prefixed(match.string, match.start()):
             return value
-        return value if value.lower() in _safe_ticket_shapes() else "<ticket>"
+        if value.lower() in _safe_ticket_shapes() or _is_allocated_label(value):
+            return value
+        return "<ticket>"
 
     rules.append((_TICKET_RE, _ticket_repl))
     rules.append((re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), "<ip>"))

@@ -1,7 +1,7 @@
 # Continuous integration for a stdlib-only tool: no install step, no cache, no
 # third-party action beyond checkout and setup-python. Every step here is a
 # command a contributor can run locally, which is the point -- CONTRIBUTING.md
-# lists the same four.
+# lists the same five.
 name: ci
 
 on:
@@ -49,6 +49,19 @@ jobs:
 
   # The checklist subsumes an import smoke test: it reports "modules import
   # N/N" and fails if any module does not.
+  # The only job that runs the tool's own logic against a known state. Every
+  # check reproduces a bug that shipped and was seen failing before its fix;
+  # the file's docstring says how each one is isolated from the runner.
+  regressions:
+    name: behaviour regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: every regression check passes
+        run: python .github/scripts/regressions.py
   checklist:
     name: dependency checklist
     runs-on: ubuntu-latest

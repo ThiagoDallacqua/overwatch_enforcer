@@ -89,6 +89,23 @@ $ oe sessions
 different length from the values the column was padded for. On a terminal, unredacted, they
 line up.)
 
+#### How sessions are listed, and where the cap is
+
+* **What a session is.** One top-level transcript, `~/.claude/projects/<project>/<id>.jsonl`.
+  Subagent and workflow transcripts sit in a folder beside it and are folded into that
+  session's figures; they are never rows of their own.
+* **Order.** Running sessions first, then most recent first by last write.
+* **The page.** `oe sessions` prints the 40 most recent unless told otherwise: `--limit N`
+  for another page size, `--limit 0` for every scanned session, `--days N` for a window. The
+  footer leads with its scope — `N of M sessions shown, most recent first` — and its totals
+  cover the rows shown, not everything on disk.
+* **The scan cap.** Every command that lists or totals sessions — `oe sessions`,
+  `oe account`, the all-time figure in `oe status` and `oe watch`, and the dashboard — reads
+  at most the newest `scan.max_sessions` transcripts (500 by default). Older sessions are not
+  counted anywhere, and each of those screens says so when it happens: `covers the newest 500
+  of M sessions`. Raise the cap in `config.json` to include them. Each extra session is
+  priced once and then cached, so the cost of a larger cap falls mostly on the first pass.
+
 ### `oe report` / `oe path` / `oe open`
 
 `report` builds the artifacts now and prints where they went. `path` prints the location
@@ -345,9 +362,11 @@ Treat them the way you would treat `cat`:
 
 ### `oe account`
 
-Labels self-configure: the first account the tool ever sees becomes `primary`, the next
-`secondary`. `list` shows the split, `whoami` names the account logged in right now, `rename`
-changes a label everywhere, and `assign` / `unassign` override a session by hand.
+Labels self-configure: the first account the tool ever sees log in becomes `primary`, the
+next `secondary` (then `secondary-2`, …). A label names a **login** this machine has seen and
+nothing more — there is no personal/work split, and `rename` is how you call them what they
+are. `list` shows the split, `whoami` names the account logged in right now, `rename` changes
+a label everywhere, and `assign` / `unassign` override sessions by hand.
 
 ```
 $ oe account list
@@ -357,10 +376,26 @@ $ oe account list
 $ oe account whoami
 ```
 
+```
+$ oe account assign <session> primary
+$ oe account assign --before 2026-06-01 primary --dry-run
+```
+
+`assign` takes one session id (or prefix) or a selector — `--before DATE`, `--after DATE`,
+`--project PATH` — plus a label, in either order; `--dry-run` prints what would change and
+writes nothing.
+
 Provenance is labelled, never guessed silently: `recorded` is the transcript's own
-bridge-session owner id, `inferred` is a low-confidence hint printed with its evidence, and
-`unknown` means nothing on disk names an account. A transcript with no bridge record reports
-`unknown` even while the live login is known.
+bridge-session owner id, `stamped` was captured from the live login while the session ran,
+`backup` means a Claude Code config snapshot brackets the session's start — circumstantial,
+so it is marked with a `?` — and `unknown` means nothing on disk names an account.
+
+**On a new install, `unknown` is mostly history.** A session can only be stamped while it is
+running, so every session that finished before the tool was installed stays `unknown` unless
+its transcript carries an owner record. That is expected, not a fault; `assign` settles it.
+The table reads the same scan as `oe sessions`, so the
+[cap](#how-sessions-are-listed-and-where-the-cap-is) applies here too, and the table says so
+when it does.
 
 ### `oe audit [session|--all]`
 
