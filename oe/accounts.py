@@ -37,6 +37,7 @@ code path that copies an address or a uuid into an artifact.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import time
 from pathlib import Path
@@ -149,6 +150,13 @@ BACKUPS_DIR = paths.CLAUDE_HOME / "backups"
 # 2: 'personal'/'work' retired, the org-hint bucket dropped, and label_map
 # entries for addresses that never logged in pruned. See _upgrade().
 STATE_VERSION = 2
+
+# Set once _upgrade() has run on a state file. A marker of its own rather than
+# `version`: every write from an older build -- a supervisor started before an
+# update, a checkout of an earlier tag -- stamps version 1, and a version-gated
+# upgrade would then run again and undo renames made since. Older builds copy
+# unknown top-level keys through untouched, so this one survives them.
+_UPGRADE_MARK = "legacy_labels_retired"
 _STATE_NAME = "accounts.json"
 
 # A 'bridge-session' line is NOT a header. Most transcripts that carry one put
@@ -316,6 +324,11 @@ def allocate_label(address: str) -> str:
         # primary" must not see a second address allocated 'primary' merely
         # because the learned map happened to be empty.
         taken = {str(v).strip() for v in mapping.values()} | _pinned_labels()
+        # Every label anything still holds is taken too, not only the map's: a
+        # hand assignment or a stamp can carry a name no login has, and handing
+        # that name to a new login would move those sessions onto it.
+        taken |= {str(row.get("label") or "").strip() for row in _each_label_holder(state)}
+        taken.discard("")
         if not mapping and LABEL_PRIMARY not in taken:
             name = LABEL_PRIMARY
         else:
@@ -426,61 +439,130 @@ def _each_label_holder(state: Dict[str, Any]):
 
 
 def _upgrade(state: Dict[str, Any]) -> bool:
-    """Bring a state file written by an older build up to STATE_VERSION, in place.
+    """Bring a state file written by an older build up to date, in place. Once.
 
-    v1 -> v2, once:
+    On a file that has never been through it:
       * label_map entries for addresses that never logged in here are dropped.
         Only the scrubber ever put them there -- it allocated a label for every
         address it met -- no session can resolve to one, and each is a third
         party's address sitting in local state.
-      * 'personal'/'work' move to current names. Collision-safe: an install that
-        allocated after the rename can hold 'work' AND 'secondary', and a blind
-        rename would merge two accounts into one label.
+      * every LOGIN still carrying 'personal' or 'work' gets a current name of
+        its own: its config pin if it has one, else the first free of 'primary'
+        (for 'personal'), 'secondary', 'secondary-N'. Per login, not per label
+        string: a legacy install could hold several logins under one 'work', and
+        a string rename would keep them merged. Pins and every label still held
+        count as taken, so no two logins end up sharing a name.
+      * a stamped row follows its login through the account uuid it carries.
+      * a legacy label on a hand assignment follows only when it maps to exactly
+        one login. Otherwise it stays as the user typed it: rewriting what
+        somebody typed into a guessed name is worse than an old word on screen,
+        and `oe account rename` settles it.
       * the 'inferred' bucket goes with the heuristic that filled it.
 
-    Runs only on a v1 file, so a label a user LATER chooses to call 'work' is
-    theirs to keep. Never raises.
+    At most once per file (_UPGRADE_MARK). A file already at version 2 without
+    the mark was written by a build whose _mutate ran this before stamping 2, so
+    it only gains the mark. Works on a copy that is swapped in only on success:
+    a failure part-way leaves the state exactly as it was, unmarked, and the
+    next pass retries. Never raises.
     """
+    if state.get(_UPGRADE_MARK):
+        return False
     try:
-        if int(state.get("version") or 1) >= 2:
-            return False
-        changed = state.pop("inferred", None) is not None
-        mapping = state.get("label_map")
+        version: Optional[int] = int(state.get("version") or 1)
+    except (TypeError, ValueError):
+        version = None                  # hand-edited or corrupt: upgrade it
+    if version is not None and version >= 2:
+        state[_UPGRADE_MARK] = True
+        return True
+    try:
+        work = copy.deepcopy(state)
+        work.pop("inferred", None)
+        mapping = work.get("label_map")
         if not isinstance(mapping, dict):
-            mapping = {}
-        logins = _login_addresses(state)
+            mapping = work["label_map"] = {}
+        logins = _login_addresses(work)
         for address in list(mapping):
             if str(address).strip().lower() not in logins:
                 del mapping[address]
-                changed = True
-        labels = [str(v).strip() for v in mapping.values()]
-        labels += [str(row.get("label") or "").strip() for row in _each_label_holder(state)]
-        in_use = {name for name in labels if name and name not in _LEGACY_LABELS}
-        rename: Dict[str, str] = {}
-        for old in _LEGACY_LABELS:
-            if old not in labels:
+        identities = work.get("identities")
+        if not isinstance(identities, dict):
+            identities = {}
+        email_of_uuid: Dict[str, str] = {}
+        first_seen: Dict[str, float] = {}
+        for uuid, row in identities.items():
+            if not isinstance(row, dict):
                 continue
-            wanted = ([LABEL_PRIMARY] if old == "personal" else []) + [LABEL_SECONDARY]
-            name = next((n for n in wanted if n not in in_use), None)
-            counter = 2
-            while name is None:
-                candidate = f"{LABEL_SECONDARY}-{counter}"
-                counter += 1
-                if candidate not in in_use:
-                    name = candidate
-            rename[old] = name
-            in_use.add(name)
-        if rename:
-            for address, label in list(mapping.items()):
-                if str(label).strip() in rename:
-                    mapping[address] = rename[str(label).strip()]
-            for row in _each_label_holder(state):
-                if str(row.get("label") or "").strip() in rename:
-                    row["label"] = rename[str(row["label"]).strip()]
-            changed = True
-        return changed
+            email = str(row.get("email") or "").strip().lower()
+            if email:
+                email_of_uuid[str(uuid)] = email
+                try:
+                    first_seen.setdefault(email, float(row.get("first_seen") or 0))
+                except (TypeError, ValueError):
+                    pass
+        # Which legacy name each login carries now.
+        carries: Dict[str, str] = {}
+        for address, label in mapping.items():
+            if str(label).strip() in _LEGACY_LABELS:
+                carries[str(address).strip().lower()] = str(label).strip()
+        for row in identities.values():
+            if isinstance(row, dict) and str(row.get("label") or "").strip() in _LEGACY_LABELS:
+                email = str(row.get("email") or "").strip().lower()
+                if email:
+                    carries.setdefault(email, str(row["label"]).strip())
+        taken = {str(v).strip() for v in mapping.values()}
+        taken |= {str(row.get("label") or "").strip() for row in _each_label_holder(work)}
+        taken = {name for name in taken if name and name not in _LEGACY_LABELS}
+        taken |= _pinned_labels()
+        pins = _config_labels()
+        legacy_email = _legacy_personal_email()
+        new_name: Dict[str, str] = {}
+        for address in sorted(carries, key=lambda a: (carries[a] != "personal",
+                                                      first_seen.get(a, 0.0), a)):
+            name = pins.get(address) or (LABEL_PRIMARY if address == legacy_email else None)
+            if not name:
+                wanted = ([LABEL_PRIMARY] if carries[address] == "personal" else []) \
+                    + [LABEL_SECONDARY]
+                name = next((n for n in wanted if n not in taken), None)
+                counter = 2
+                while name is None:
+                    candidate = f"{LABEL_SECONDARY}-{counter}"
+                    counter += 1
+                    if candidate not in taken:
+                        name = candidate
+            new_name[address] = name
+            taken.add(name)
+        for address in list(mapping):
+            if str(address).strip().lower() in new_name:
+                mapping[address] = new_name[str(address).strip().lower()]
+        for row in identities.values():
+            if isinstance(row, dict):
+                email = str(row.get("email") or "").strip().lower()
+                if email in new_name:
+                    row["label"] = new_name[email]
+        by_legacy: Dict[str, set] = {}
+        for address, old in carries.items():
+            by_legacy.setdefault(old, set()).add(new_name[address])
+        for bucket in ("stamped", "assigned"):
+            rows = work.get(bucket)
+            if not isinstance(rows, dict):
+                continue
+            for row in rows.values():
+                if not isinstance(row, dict):
+                    continue
+                label = str(row.get("label") or "").strip()
+                if label not in _LEGACY_LABELS:
+                    continue
+                email = email_of_uuid.get(str(row.get("uuid"))) if bucket == "stamped" else None
+                if email and email in new_name:
+                    row["label"] = new_name[email]
+                elif len(by_legacy.get(label, ())) == 1:
+                    row["label"] = next(iter(by_legacy[label]))
+        work[_UPGRADE_MARK] = True
     except Exception:
         return False
+    state.clear()
+    state.update(work)
+    return True
 
 
 def load_state() -> Dict[str, Any]:

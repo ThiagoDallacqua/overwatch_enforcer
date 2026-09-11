@@ -19,6 +19,8 @@ directory, Claude home and reports root, so:
   * nothing here can read or write this machine's real state;
   * paths.PROJECTS_ROOT, which is fixed at import time, points where the
     scenario says it does;
+  * the install root is an empty directory, so this machine's config.json is
+    never read -- a local run and a CI run see the same defaults;
   * results come back in a JSON file, never on stdout -- bin/oe installs its
     output scrubber at import, and a scrubbed result would test the scrubber by
     accident.
@@ -99,9 +101,16 @@ def _sandbox(tmp: Path, state: Optional[Dict[str, Any]], sessions: int,
             # and nothing here may look like a live session.
             stamp = 1_700_000_000 + index * 3600
             os.utime(path, (stamp, stamp))
+    # An empty install root: config.json lives there, so no scenario reads the
+    # config of the machine running the checks -- a local pin or cap must not make
+    # a local run disagree with CI, which has none. The code itself is imported
+    # from ROOT, through PYTHONPATH for bin/oe and through the prelude otherwise.
+    install = tmp / "install"
+    install.mkdir()
     out = tmp / "out.json"
     env = dict(os.environ, OE_STATE_DIR=str(state_dir), CLAUDE_CONFIG_DIR=str(home),
-               OE_REPORTS_ROOT=str(reports), OE_REDACT="0",
+               OE_REPORTS_ROOT=str(reports), OE_REDACT="0", OE_INSTALL_ROOT=str(install),
+               PYTHONPATH=os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p),
                REGRESSION_OUT=str(out), REGRESSION_ARGS=json.dumps(args))
     return env, out
 
@@ -119,13 +128,13 @@ def scenario(body: str, *, state: Optional[Dict[str, Any]] = None, sessions: int
 
 
 def cli(argv: List[str], *, state: Optional[Dict[str, Any]] = None,
-        sessions: int = 0) -> str:
-    """Run bin/oe in the same kind of sandbox; return stdout + stderr."""
+        sessions: int = 0) -> Tuple[int, str]:
+    """Run bin/oe in the same kind of sandbox; return (exit code, stdout + stderr)."""
     with tempfile.TemporaryDirectory() as raw:
         env, _ = _sandbox(Path(raw), state, sessions, {})
         proc = subprocess.run([sys.executable, str(ROOT / "bin" / "oe"), *argv],
                               env=env, capture_output=True, text=True, timeout=180)
-        return proc.stdout + proc.stderr
+        return proc.returncode, proc.stdout + proc.stderr
 
 
 def _identity(email: str, label: str) -> Dict[str, Any]:
@@ -303,6 +312,123 @@ def check_reading_state_never_writes_it() -> Tuple[bool, Any]:
     return got is True, got
 
 
+def check_new_login_never_reuses_a_held_label() -> Tuple[bool, Any]:
+    """A login allocated after the upgrade gets a name nothing else holds, and a
+    hand-assigned legacy label with no login behind it stays as the user typed it.
+
+    Found in review: `oe account assign` in v1.0.x accepted only personal/work, so
+    every hand assignment on a self-configured install is one of those words. The
+    upgrade renamed them to secondary-N, allocation ignored labels held outside
+    label_map, and the next login was handed the same name -- moving the user's
+    own assigned sessions onto somebody else's account.
+    """
+    state = {"version": 1, "identities": {"uuid-a": _identity(E1, "primary")},
+             "label_map": {E1: "primary"},
+             "assigned": {"s1": {"label": "personal", "ts": 0},
+                          "s2": {"label": "work", "ts": 0}}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)
+        new = accounts.label_for_email(ARGS["new"])
+        state = accounts.load_state()
+        emit({"new": new, "s1": state["assigned"]["s1"]["label"],
+              "s2": state["assigned"]["s2"]["label"]})
+    """, state=state, args={"new": E2})
+    return got == {"new": "secondary", "s1": "personal", "s2": "work"}, got
+
+
+def check_upgrade_runs_once_despite_old_writes() -> Tuple[bool, Any]:
+    """Once upgraded, a state file stays upgraded after an older build writes
+    `version: 1` back over it.
+
+    Found in review: the version number was the only mark that the upgrade had
+    run, and every write from an older build -- a supervisor started before the
+    update, a checkout of an earlier tag -- stamps 1. The next read renamed labels
+    again, undoing a rename the user had made in between.
+    """
+    state = {"version": 1, "identities": {"uuid-a": _identity(E1, "personal")},
+             "label_map": {E1: "personal"}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)          # the upgrade: personal -> primary
+        accounts.rename_label("primary", "work")        # the user's own choice, later
+        path = accounts.state_path()
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        raw["version"] = 1                              # what an older build writes
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle)
+        accounts._mutate(lambda _state: False)
+        emit(accounts.label_for_email(ARGS["own"]))
+    """, state=state, args={"own": E1})
+    return got == "work", got
+
+
+def check_upgrade_respects_config_pins() -> Tuple[bool, Any]:
+    """The upgrade never gives a legacy label a name the config pins to another
+    address -- two logins under one label is a silent merge."""
+    state = {"version": 1, "identities": {"uuid-b": _identity(E2, "personal")},
+             "label_map": {E2: "personal"}}
+    got = scenario("""
+        from oe import accounts, paths
+        base = paths.load_config()
+        paths.load_config = lambda: dict(base, accounts={"labels": {ARGS["pinned"]: "primary"}})
+        emit([accounts.label_for_email(ARGS["pinned"]), accounts.label_for_email(ARGS["legacy"])])
+    """, state=state, args={"pinned": E1, "legacy": E2})
+    ok = isinstance(got, list) and got[0] == "primary" and got[1] not in ("primary", "personal")
+    return ok, got
+
+
+def check_upgrade_survives_a_non_integer_version() -> Tuple[bool, Any]:
+    """A hand-edited or corrupt `version` still gets the upgrade, instead of
+    making it skip for good while the next write stamps the file as done."""
+    state = {"version": "v1", "identities": {"uuid-a": _identity(E1, "personal")},
+             "label_map": {E1: "personal", E4: "secondary"}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)
+        with open(accounts.state_path(), encoding="utf-8") as handle:
+            emit(json.load(handle)["label_map"])
+    """, state=state)
+    return got == {E1: "primary"}, got
+
+
+def check_dashboard_page_announces_the_cap() -> Tuple[bool, Any]:
+    """The dashboard says when its totals cover only the newest sessions.
+
+    Found in review: render() redacted the rows before reading the scan's scope,
+    and redaction returns a plain list -- so the page always said all-time.
+    """
+    got = scenario("""
+        from oe import dashboard, ledger
+        rows = ledger.ScanRows([])
+        rows.found, rows.cap = 900, 500
+        page = dashboard.render(rows)
+        emit({"spend_label": "Spend, newest 500" in page,
+              "names_the_knob": "scan.max_sessions" in page,
+              "claims_all_time": "All-time spend" in page})
+    """)
+    return got == {"spend_label": True, "names_the_knob": True, "claims_all_time": False}, got
+
+
+def check_failed_scan_clears_the_cap_caption() -> Tuple[bool, Any]:
+    """A scan that fails does not leave the previous scan's cap on screen."""
+    got = scenario("""
+        import importlib.machinery, importlib.util
+        path = os.path.join(sys.path[0], "bin", "oe")
+        loader = importlib.machinery.SourceFileLoader("oe_cli", path)
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("oe_cli", loader))
+        loader.exec_module(module)
+        module._SCAN_SCOPE.update(found=5, cap=3)
+        def unreadable(*_args, **_kwargs):
+            raise RuntimeError("corpus unreadable")
+        module.ledger_mod.scan_sessions = unreadable
+        module._rows()
+        emit(module._scan_capped())
+    """)
+    return got is False, got
+
+
 def check_legacy_config_pin_maps_to_primary() -> Tuple[bool, Any]:
     """The old `accounts.personal_email` key still means 'this one is primary',
     and every other address is allocated around it instead of becoming 'work'."""
@@ -341,21 +467,65 @@ def check_sessions_footer_names_its_scope() -> Tuple[bool, Any]:
     Shipped bug: the footer led with '2 sessions', which reads as a total, and
     put '(listed rows only)' at the end of the line where a narrow pane drops it.
     """
-    out = cli(["sessions", "--limit", "2"], sessions=5)
+    code, out = cli(["sessions", "--limit", "2"], sessions=5)
     footer = [line.strip() for line in out.splitlines() if "session" in line and "$" in line]
-    return any(line.startswith("2 of 5 sessions") for line in footer), footer or out[-400:]
+    ok = code == 0 and any(line.startswith("2 of 5 sessions") for line in footer)
+    return ok, {"exit": code, "footer": footer or out[-400:]}
+
+
+def _xterm_rgb(index: int) -> Tuple[int, int, int]:
+    """The RGB a 256-colour xterm index draws as: 16 system colours, the 6x6x6 cube,
+    then the 24-step grey ramp."""
+    system = [(0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128),
+              (0, 128, 128), (192, 192, 192), (128, 128, 128), (255, 0, 0), (0, 255, 0),
+              (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
+    if index < 16:
+        return system[index]
+    if index < 232:
+        steps = (0, 95, 135, 175, 215, 255)
+        cube = index - 16
+        return steps[cube // 36], steps[(cube // 6) % 6], steps[cube % 6]
+    grey = 8 + (index - 232) * 10
+    return grey, grey, grey
+
+
+def _luminance(rgb: Tuple[int, int, int]) -> float:
+    def linear(channel: int) -> float:
+        value = channel / 255
+        return value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+    red, green, blue = (linear(channel) for channel in rgb)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _near_white_constants(text: str) -> List[str]:
+    """Palette constants whose colour all but vanishes on a white background."""
+    bad = []
+    for match in re.finditer(r'^([A-Z_]+) = "([0-9;]+)"', text, re.M):
+        codes = match.group(2).split(";")
+        rgbs = [_xterm_rgb(int(codes[i + 2])) for i in range(len(codes) - 2)
+                if codes[i:i + 2] == ["38", "5"] and codes[i + 2].isdigit()
+                and int(codes[i + 2]) < 256]
+        rgbs += [(255, 255, 255) for code in codes if code == "97"]
+        if any(_luminance(rgb) >= 0.75 for rgb in rgbs):
+            bad.append(match.group(0))
+    return bad
 
 
 def check_palette_is_readable_on_light_backgrounds() -> Tuple[bool, Any]:
     """No palette colour is a fixed near-white.
 
     Shipped bug: labels printed in 256-colour 255 vanished on a light terminal.
-    A source check, and it knows it: it proves no constant is near-white, not
+    Judged by luminance, not by index, because white has several spellings (15,
+    231, 255, SGR 97) and an index list misses the ones nobody thought of. The
+    detector must first catch planted near-whites, or its silence means nothing.
+    It is a source check and knows it: it proves no constant is near-white, not
     that every call site picked a sensible one.
     """
-    text = (ROOT / "bin" / "oe").read_text(encoding="utf-8")
-    bad = [m.group(0) for m in re.finditer(r'^[A-Z_]+ = "38;5;(\d+)"', text, re.M)
-           if 250 <= int(m.group(1)) <= 255]
+    planted = 'A = "38;5;231"\nB = "38;5;15"\nC = "97"\nD = "38;5;255"\nE = "38;5;244"\n'
+    caught = _near_white_constants(planted)
+    if len(caught) != 4:
+        return False, {"detector_broken": caught}
+    bad = _near_white_constants((ROOT / "bin" / "oe").read_text(encoding="utf-8"))
     return not bad, bad
 
 
@@ -366,6 +536,12 @@ CHECKS: List[Callable[[], Tuple[bool, Any]]] = [
     check_known_label_is_not_a_ticket,
     check_legacy_labels_migrate_without_collision,
     check_reading_state_never_writes_it,
+    check_new_login_never_reuses_a_held_label,
+    check_upgrade_runs_once_despite_old_writes,
+    check_upgrade_respects_config_pins,
+    check_upgrade_survives_a_non_integer_version,
+    check_dashboard_page_announces_the_cap,
+    check_failed_scan_clears_the_cap_caption,
     check_legacy_config_pin_maps_to_primary,
     check_scan_reports_what_the_cap_dropped,
     check_sessions_footer_names_its_scope,
