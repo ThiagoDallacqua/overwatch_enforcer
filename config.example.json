@@ -26,5 +26,10 @@
     "max_raw_calls": 4000
   },
   "accounts": {},
-  "redact_cli": "auto"
+  "redact_cli": "auto",
+  "brief": {
+    "enabled": false,
+    "budget_tokens": 1500,
+    "gate_threshold": 0.35
+  }
 }

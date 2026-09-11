@@ -45,18 +45,38 @@ WARN = "warn"
 # half-copied checkout FAILS instead of silently installing fewer hooks.
 MODULES: Tuple[str, ...] = (
     "paths", "pricing", "ledger", "report", "statusline", "watcher", "dashboard",
-    "redact", "accounts", "store", "retrieval", "shrink", "brief", "autostart",
+    "redact", "accounts", "store", "retrieval", "shrink", "brief", "prior",
+    "autostart",
     "checklist",
 )
 
 HOOK_SCRIPTS: Tuple[str, ...] = (
     "session_start.py", "user_prompt_submit.py", "session_end.py",
+    # Shipped always, REGISTERED only when config's `brief.enabled` is true.
+    # It belongs here because this check asks whether the file is present and
+    # readable, and a hook that is missing from the package cannot be switched
+    # on later. Whether it is registered is install.py's question, not this one.
+    "agent_spawn.py",
 )
 
 # The hook events we register. Verified against the Claude Code binary at check
 # time rather than trusted -- an event this version does not know is an entry
 # that will sit in settings.json forever doing nothing.
 HOOK_EVENTS: Tuple[str, ...] = (
+    "SessionStart", "UserPromptSubmit", "SessionEnd",
+    # Only registered when the spawn brief is switched on, but the check this
+    # feeds asks whether THIS Claude Code build knows the event name -- which is
+    # worth knowing before anyone switches it on, not after.
+    "PreToolUse",
+)
+
+#: The events an install actually WIRES. Distinct from HOOK_EVENTS, which is the
+#: set whose names are probed against the Claude Code binary. Counting the wired
+#: hooks against HOOK_EVENTS reported "3/4 wired" on every machine that had not
+#: switched the optional hook on, with a remedy -- re-run the installer -- that
+#: could never clear it. A check that cries wolf trains its reader to skip the
+#: line that would have reported a real break.
+REGISTERED_EVENTS: Tuple[str, ...] = (
     "SessionStart", "UserPromptSubmit", "SessionEnd",
 )
 
@@ -376,7 +396,7 @@ def check_wiring(report: Report, root: Path, settings_path: Path) -> None:
         report.add("Claude Code", "hooks wired", True, "not wired (optional)",
                    "this checkout, or nothing", "")
         return
-    expected = len(HOOK_EVENTS)
+    expected = len(REGISTERED_EVENTS)
     report.add("Claude Code", "hooks wired", mine >= expected,
                f"{mine}/{expected} hook entries -> this checkout"
                + (" + statusLine" if statusline else ""),

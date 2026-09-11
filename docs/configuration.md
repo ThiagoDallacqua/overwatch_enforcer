@@ -106,6 +106,23 @@ each falls back to the value below:
 | `max_track_age_seconds` | `86400.0` | drop a track older than this |
 | `report_interval_seconds` | per-session default | how often `report.html` is rebuilt while a session keeps writing |
 
+### `brief` — the subagent spawn brief
+
+Governs the one hook that is **not registered unless you ask for it**. See
+[The spawn brief](commands.md#the-spawn-brief-off-by-default) for what it does and how to
+remove it.
+
+| key | default | meaning |
+|---|---|---|
+| `enabled` | `false` | whether `install.py` registers the `PreToolUse` hook at all. Setting this back to false and re-running `install.py --yes` UNREGISTERS it — that is the supported way out, not a hand edit |
+| `budget_tokens` | `1500` | ceiling on the injected text. A bound rather than an optimum: chosen so that a brief which is entirely wrong still costs less than one avoided whole-file read |
+| `gate_threshold` | `0.35` | how read-heavy the last few finished agents must have been before a brief is worth paying for |
+
+The gate reads a rolling figure written by `SessionEnd` and **fails closed on every doubt** —
+no prior recorded, nothing to measure, a prior older than six hours, or a rate below the
+threshold all mean no injection. Nothing about the gate costs tokens; it is local file I/O over
+transcripts Claude Code has already written.
+
 ## Environment variables
 
 Ours:

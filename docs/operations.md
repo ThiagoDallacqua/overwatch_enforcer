@@ -270,6 +270,11 @@ $OE/state/
   accounts.lock                   the flock beside it
   cost-cache/<session-id>.json    the incremental parse cache
   context.db                      the context index
+  agent-prior.json                how read-heavy the last few finished subagents were,
+                                  refreshed by SessionEnd and read by the spawn hook
+  agent-brief.ndjson              one line per brief actually injected: when, how many
+                                  tokens, how many files. Written only while
+                                  `brief.enabled` is true
   <session-id>.live.json          the snapshot the status line reads
   <session-id>.injector.json      the budget line's per-session rate-limit state
   supervisor.{pid,lock,json,log}  the daemon

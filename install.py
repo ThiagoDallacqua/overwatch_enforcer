@@ -139,6 +139,58 @@ HOOK_PLAN: List[Tuple[str, str, int]] = [
     ("SessionEnd", "session_end.py", 180),
 ]
 
+#: Hooks that are NOT registered unless config explicitly asks for them. Kept
+#: SEPARATE from HOOK_PLAN rather than filtered out of it, so the one hook that
+#: runs on the tool-call path reads as an exception instead of hiding inside a
+#: list comprehension.
+#:
+#: The fourth element is the matcher. A group with NO matcher applies to every
+#: tool -- which is what the retired read guard did, and the reason it was
+#: expensive. Matched on `Agent`, this fires only when a subagent is spawned.
+OPTIONAL_HOOK_PLAN: List[Tuple[str, str, int, str]] = [
+    ("PreToolUse", "agent_spawn.py", 5, "Agent"),
+]
+
+
+def brief_enabled(config: Any) -> bool:
+    """Has the owner switched the spawn brief on? The default is false.
+
+    `is True`, not truthiness. config.json is hand-edited, and the string
+    "false" is truthy -- which would switch a tool-call-path hook ON for someone
+    who wrote it meaning to keep it off.
+    """
+    section = config.get("brief") if isinstance(config, dict) else None
+    return bool(isinstance(section, dict) and section.get("enabled") is True)
+
+
+def active_plan(config: Any) -> List[Tuple[str, str, int, Optional[str]]]:
+    """What this install should register, as (event, script, timeout, matcher)."""
+    plan: List[Tuple[str, str, int, Optional[str]]] = [
+        (event, script, timeout, None) for event, script, timeout in HOOK_PLAN]
+    if brief_enabled(config):
+        plan.extend(OPTIONAL_HOOK_PLAN)
+    return plan
+
+
+def live_entries(config: Any) -> set:
+    """(event, script) pairs this install is registering right now.
+
+    Used to exempt the spawn hook from the retirement sweep WITHOUT un-retiring
+    its event. An earlier version of this exempted the whole `PreToolUse` event,
+    and that was a bricking bug: a machine upgrading from the release that had
+    the read guard still carries a `PreToolUse` entry pointing at
+    `hooks/pre_tool_use.py`, a script this project deleted. The sweep is the only
+    thing that removes it -- `pre_tool_use.py` is not in OUR_SCRIPTS, so
+    `stale_entry` never fires, and `is_ours` is true, so the foreign-install
+    branch never fires either. Suppressing the whole event left that entry in
+    place, and a registered PreToolUse hook naming a missing script breaks every
+    tool call in every session on the machine.
+
+    Exempting the PAIR keeps the sweep fully armed for everything else.
+    """
+    return {(event, script) for event, script, _t, _m in active_plan(config)}
+
+
 #: Events this tool registered in an EARLIER version and no longer wants. An
 #: install has to actively take these out: settings.json is the user's file and
 #: nothing else will ever remove a stale entry pointing at a script we deleted.
@@ -614,7 +666,36 @@ def is_ours(command: Any, install_dir: Path) -> bool:
 # names one of these, in a directory of the right shape, is ours whatever root
 # it was installed from -- which is the only way to recognise the entries a
 # PREVIOUS location left behind.
-OUR_SCRIPTS = {script for _, script, _ in HOOK_PLAN} | {"statusline.py"}
+#
+# OPTIONAL_HOOK_PLAN's script is included unconditionally, and that is the point:
+# recognising our own leftovers must not depend on the current config. If the
+# brief is switched off, the entry it left behind still has to be recognisable
+# as ours so the retirement sweep can remove it.
+OUR_SCRIPTS = ({script for _, script, _ in HOOK_PLAN}
+               | {script for _e, script, _t, _m in OPTIONAL_HOOK_PLAN}
+               | {"statusline.py"})
+
+_CONFIG_CACHE: Dict[str, Any] = {}
+
+
+def installer_config() -> Dict[str, Any]:
+    """config.json beside this installer, or {}. Read once, never written.
+
+    Read here rather than threaded through every signature because the only
+    thing it decides is whether one optional hook is in the plan, and widening
+    three signatures in this file to carry one boolean is the riskier edit.
+    """
+    if "value" not in _CONFIG_CACHE:
+        value: Dict[str, Any] = {}
+        try:
+            with (HERE / "config.json").open(encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                value = loaded
+        except Exception:
+            value = {}
+        _CONFIG_CACHE["value"] = value
+    return _CONFIG_CACHE["value"]
 
 
 def our_script_path(command: Any) -> Optional[Path]:
@@ -692,7 +773,14 @@ def sweep_stale(settings: Dict[str, Any], install_dir: Path) -> List[str]:
         # the next release deletes the script and the entry then breaks every
         # tool call in every session on this machine.
         if event in RETIRED_EVENTS and is_ours(command, install_dir):
-            return True
+            # ... unless it is a hook this very run is registering. Only the
+            # (event, script) PAIR is exempt; every other entry under a retired
+            # event is still swept, which is what keeps a deleted script from
+            # surviving in settings.json.
+            script_path = our_script_path(command)
+            if not (script_path is not None
+                    and (event, script_path.name) in live_entries(installer_config())):
+                return True
         if our_script_path(command) is not None and not is_ours(command, install_dir):
             live_elsewhere.append(str(command))
         return False
@@ -797,7 +885,7 @@ def merge_hooks(settings: Dict[str, Any], interpreter: str,
         raise SystemExit(f"settings 'hooks' is a {type(hooks).__name__}, expected an "
                          "object; refusing to touch it")
 
-    for event, script, timeout in HOOK_PLAN:
+    for event, script, timeout, matcher in active_plan(installer_config()):
         command = hook_command(interpreter, script, install_dir)
         desired = {"type": "command", "command": command, "timeout": timeout}
 
@@ -822,20 +910,42 @@ def merge_hooks(settings: Dict[str, Any], interpreter: str,
                     existing = entry
                     break
             if existing is not None:
+                # Found, but possibly in the WRONG group. Updating it where it
+                # sits would be the quiet catastrophe: our hook left in a group
+                # with no matcher runs before EVERY tool call, which is exactly
+                # the cost that retired the previous tool-call hook. A hand edit
+                # or an older install is enough to put it there, so move it
+                # rather than trusting where it was found.
+                if (group.get("matcher") or None) != matcher:
+                    group["hooks"] = [e for e in group.get("hooks") or [] if e is not existing]
+                    changes.append(
+                        f"move hook: {event} -> hooks/{script} out of "
+                        f"[{group.get('matcher') or 'matcher omitted'}] into "
+                        f"[{('matcher ' + matcher) if matcher else 'matcher omitted'}]")
+                    existing = None
                 break
 
         if existing is None:
-            # A group with no matcher applies to every tool, which is what we
-            # want for PostToolUse; for non-tool events a matcher is meaningless.
+            # A group with no matcher applies to EVERY tool. For the three
+            # non-tool events a matcher is meaningless, so they go in the
+            # unmatched group. A hook carrying a matcher must land in a group
+            # with exactly that matcher -- putting it in the unmatched group
+            # would fire it before every tool call, which is the cost that
+            # retired the previous tool-call hook.
             target = None
             for group in groups:
-                if isinstance(group, dict) and not group.get("matcher"):
+                if not isinstance(group, dict):
+                    continue
+                if (group.get("matcher") or None) == matcher:
                     target = group
                     break
             if target is None:
                 target = {"hooks": []}
+                if matcher:
+                    target["matcher"] = matcher
                 groups.append(target)
-                changes.append(f"add group: hooks.{event}[matcher omitted]")
+                changes.append(f"add group: hooks.{event}"
+                               f"[{('matcher ' + matcher) if matcher else 'matcher omitted'}]")
             entries = target.setdefault("hooks", [])
             if not isinstance(entries, list):
                 raise SystemExit(f"settings hooks.{event}[].hooks is not a list; refusing")
@@ -959,7 +1069,8 @@ def install_state(settings: Dict[str, Any], install_dir: Path) -> Dict[str, Any]
     merge, so this exists to SAY so rather than to change what happens.
     """
     present: List[str] = []
-    for event, script, _ in HOOK_PLAN:
+    plan = active_plan(installer_config())
+    for event, script, _timeout, _matcher in plan:
         groups = (settings.get("hooks") or {}).get(event) if isinstance(
             settings.get("hooks"), dict) else None
         hit = False
@@ -976,7 +1087,7 @@ def install_state(settings: Dict[str, Any], install_dir: Path) -> Dict[str, Any]
             present.append(event)
     status = settings.get("statusLine")
     has_status = isinstance(status, dict) and is_ours(status.get("command"), install_dir)
-    total = len(HOOK_PLAN)
+    total = len(plan)
     if not present and not has_status:
         state = "absent"
     elif len(present) == total:
@@ -985,7 +1096,7 @@ def install_state(settings: Dict[str, Any], install_dir: Path) -> Dict[str, Any]
         state = "partial"
     return {"state": state, "hooks_present": len(present), "hooks_expected": total,
             "statusline": has_status,
-            "missing": [e for e, _, _ in HOOK_PLAN if e not in present]}
+            "missing": [e for e, _s, _t, _m in plan if e not in present]}
 
 
 # ---------------------------------------------------------------------------

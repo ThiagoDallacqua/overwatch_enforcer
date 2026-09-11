@@ -2359,17 +2359,21 @@ def _hook_events() -> Dict[str, str]:
     """
     try:
         import install as installer
-        return {event: script for event, script, _timeout in installer.HOOK_PLAN}
+        # active_plan(), not HOOK_PLAN: the optional spawn hook is registered
+        # only when config asks for it, and a checker that reported it as
+        # missing on every machine that had not switched it on would be
+        # crying wolf about a hook nobody asked for.
+        return {event: script
+                for event, script, _timeout, _matcher
+                in installer.active_plan(installer.installer_config())}
     except Exception:
+        # The installer could not be imported. These are the events v1.0.1
+        # registers; the six this tool RETIRED are deliberately absent, because
+        # naming a script that no longer exists sends the reader hunting for a
+        # file that was deleted on purpose.
         return {
             "SessionStart": "session_start.py",
             "UserPromptSubmit": "user_prompt_submit.py",
-            "PreToolUse": "pre_tool_use.py",
-            "PostToolUse": "post_tool_use.py",
-            "PostToolUseFailure": "post_tool_use.py",
-            "Stop": "stop.py",
-            "PreCompact": "pre_compact.py",
-            "PostCompact": "post_compact.py",
             "SessionEnd": "session_end.py",
         }
 

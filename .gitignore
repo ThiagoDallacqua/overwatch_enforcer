@@ -73,6 +73,7 @@ oe/*
 !oe/__init__.py
 !oe/accounts.py
 !oe/brief.py
+!oe/prior.py
 !oe/autostart.py
 !oe/checklist.py
 !oe/corpus.py
@@ -93,6 +94,7 @@ oe/*
 
 !hooks/
 hooks/*
+!hooks/agent_spawn.py
 !hooks/session_end.py
 !hooks/session_start.py
 !hooks/user_prompt_submit.py
