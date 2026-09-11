@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -82,7 +83,7 @@ def _transcript(session_id: str) -> str:
 
 
 def _sandbox(tmp: Path, state: Optional[Dict[str, Any]], sessions: int,
-             args: Dict[str, Any]) -> Tuple[Dict[str, str], Path]:
+             args: Dict[str, Any], recent: int = 0) -> Tuple[Dict[str, str], Path]:
     state_dir = tmp / "state"
     home = tmp / "claude"
     reports = tmp / "reports"
@@ -97,9 +98,11 @@ def _sandbox(tmp: Path, state: Optional[Dict[str, Any]], sessions: int,
             sid = f"0000000{index}-0000-4000-8000-00000000000{index}"
             path = project / f"{sid}.jsonl"
             path.write_text(_transcript(sid), encoding="utf-8")
-            # Distinct, old mtimes: newest-first order is part of what is tested,
-            # and nothing here may look like a live session.
-            stamp = 1_700_000_000 + index * 3600
+            # Distinct mtimes: newest-first order is part of what is tested. The
+            # first `recent` are hours old -- inside a --days 1 window, outside
+            # the live window -- and the rest are years old.
+            stamp = (time.time() - 3600 * (index + 1) if index < recent
+                     else 1_700_000_000 + index * 3600)
             os.utime(path, (stamp, stamp))
     # An empty install root: config.json lives there, so no scenario reads the
     # config of the machine running the checks -- a local pin or cap must not make
@@ -128,10 +131,10 @@ def scenario(body: str, *, state: Optional[Dict[str, Any]] = None, sessions: int
 
 
 def cli(argv: List[str], *, state: Optional[Dict[str, Any]] = None,
-        sessions: int = 0) -> Tuple[int, str]:
+        sessions: int = 0, recent: int = 0) -> Tuple[int, str]:
     """Run bin/oe in the same kind of sandbox; return (exit code, stdout + stderr)."""
     with tempfile.TemporaryDirectory() as raw:
-        env, _ = _sandbox(Path(raw), state, sessions, {})
+        env, _ = _sandbox(Path(raw), state, sessions, {}, recent)
         proc = subprocess.run([sys.executable, str(ROOT / "bin" / "oe"), *argv],
                               env=env, capture_output=True, text=True, timeout=180)
         return proc.returncode, proc.stdout + proc.stderr
@@ -313,14 +316,15 @@ def check_reading_state_never_writes_it() -> Tuple[bool, Any]:
 
 
 def check_new_login_never_reuses_a_held_label() -> Tuple[bool, Any]:
-    """A login allocated after the upgrade gets a name nothing else holds, and a
-    hand-assigned legacy label with no login behind it stays as the user typed it.
+    """A hand-assigned legacy label with no login behind it stays as typed, so a
+    login allocated after the upgrade cannot inherit its sessions.
 
     Found in review: `oe account assign` in v1.0.x accepted only personal/work, so
     every hand assignment on a self-configured install is one of those words. The
-    upgrade renamed them to secondary-N, allocation ignored labels held outside
-    label_map, and the next login was handed the same name -- moving the user's
-    own assigned sessions onto somebody else's account.
+    upgrade renamed them to secondary-N -- names no login had -- and the next login
+    was allocated the same name, moving the user's own assigned sessions onto
+    somebody else's account. What guards it is the upgrade minting no
+    free-floating names, not allocation skipping them.
     """
     state = {"version": 1, "identities": {"uuid-a": _identity(E1, "primary")},
              "label_map": {E1: "primary"},
@@ -427,6 +431,149 @@ def check_failed_scan_clears_the_cap_caption() -> Tuple[bool, Any]:
         emit(module._scan_capped())
     """)
     return got is False, got
+
+
+def check_first_login_is_primary_after_an_early_assignment() -> Tuple[bool, Any]:
+    """Assigning a session to 'primary' before any login is seen does not cost the
+    first login its name: the session joins it, as the name says.
+
+    Found in review of a fix: allocation briefly counted hand-assigned names as
+    taken, so the first real login on such a machine became 'secondary' for good.
+    """
+    got = scenario("""
+        from oe import accounts
+        accounts.assign(["early-session"], "primary")
+        emit(accounts.label_for_email(ARGS["own"]))
+    """, args={"own": E1})
+    return got == "primary", got
+
+
+def check_failed_upgrade_is_retried() -> Tuple[bool, Any]:
+    """An upgrade that fails is retried by the next write, instead of an ordinary
+    write in between stamping the file as upgraded.
+
+    Found in review of a fix: every write stamped version 2, and version 2 was
+    read as "already upgraded" -- so one exception during a supervisor tick left
+    the legacy labels and a stranger's address in place for good.
+    """
+    state = {"version": 1, "identities": {"uuid-a": _identity(E1, "personal")},
+             "label_map": {E1: "personal", E4: "secondary"},
+             "inferred": {"s3": {"hint": "org_quota", "scanned_bytes": 5}}}
+    got = scenario("""
+        from oe import accounts
+        real = accounts._pinned_labels
+        calls = {"n": 0}
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient")
+            return real(*args, **kwargs)
+        accounts._pinned_labels = flaky
+        def stamp(state):
+            state.setdefault("stamped", {})["s-new"] = {"uuid": "uuid-a", "label": "primary", "ts": 0}
+            return True
+        accounts._mutate(stamp)                   # an ordinary write while the upgrade fails
+        accounts._mutate(lambda _state: False)    # the next pass
+        with open(accounts.state_path(), encoding="utf-8") as handle:
+            disk = json.load(handle)
+        emit({"label_map": disk.get("label_map"), "inferred": "inferred" in disk,
+              "marked": bool(disk.get("legacy_labels_retired")), "version": disk.get("version")})
+    """, state=state)
+    want = {"label_map": {E1: "primary"}, "inferred": False, "marked": True, "version": 2}
+    return got == want, got
+
+
+def check_old_build_rows_are_resynced() -> Tuple[bool, Any]:
+    """What an older build writes after the upgrade is cleaned up again, without
+    undoing a rename the user made.
+
+    Found in review of a fix: once the upgrade was marked done it never ran again,
+    so a supervisor still on the old build could write legacy words onto login
+    and stamp rows, re-add a stranger's address, and bring back the hint bucket
+    -- permanently.
+    """
+    state = {"version": 2, "legacy_labels_retired": True,
+             "identities": {"uuid-a": _identity(E1, "primary"),
+                            "uuid-b": _identity(E2, "work")},
+             "label_map": {E1: "primary", E2: "work"},      # 'work': the user's own rename
+             "stamped": {"s1": {"uuid": "uuid-a", "label": "primary", "ts": 0}}}
+    got = scenario("""
+        from oe import accounts
+        path = accounts.state_path()
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        raw["version"] = 1                                   # an older build wrote it
+        raw["identities"]["uuid-a"]["label"] = "personal"
+        raw["stamped"]["s9"] = {"uuid": "uuid-a", "label": "work", "ts": 0}
+        raw["label_map"][ARGS["other"]] = "secondary"        # its scrubber allocating again
+        raw["inferred"] = {}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle)
+        accounts._mutate(lambda _state: False)
+        with open(path, encoding="utf-8") as handle:
+            disk = json.load(handle)
+        emit({"identity_a": disk["identities"]["uuid-a"]["label"],
+              "stamp_s9": disk["stamped"]["s9"]["label"],
+              "users_rename": disk["label_map"].get(ARGS["second"]),
+              "stranger_kept": ARGS["other"] in disk["label_map"],
+              "inferred": "inferred" in disk, "version": disk.get("version")})
+    """, state=state, args={"other": E4, "second": E2})
+    want = {"identity_a": "primary", "stamp_s9": "primary", "users_rename": "work",
+            "stranger_kept": False, "inferred": False, "version": 2}
+    return got == want, got
+
+
+def check_login_without_a_map_entry_is_not_split() -> Tuple[bool, Any]:
+    """A login known only from its identity row keeps ONE name: the one the
+    upgrade gave its old sessions is the one it gets from then on.
+
+    Found in review of a fix: the upgrade renamed the identity and its stamps but
+    wrote no map entry, so the next lookup allocated the login a second name --
+    old sessions under one label, new ones under another.
+    """
+    state = {"version": 1,
+             "identities": {"uuid-a": _identity(E1, "primary"),
+                            "uuid-b": _identity(E2, "work")},
+             "label_map": {E1: "primary"},
+             "stamped": {"s2": {"uuid": "uuid-b", "label": "work", "ts": 0}}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)
+        state = accounts.load_state()
+        emit({"login": accounts.label_for_email(ARGS["second"]),
+              "stamp": state["stamped"]["s2"]["label"]})
+    """, state=state, args={"second": E2})
+    ok = isinstance(got, dict) and got.get("login") == got.get("stamp") == "secondary"
+    return ok, got
+
+
+def check_v2_file_without_the_mark_is_not_renamed_again() -> Tuple[bool, Any]:
+    """A file at version 2 with no marker was written by a build that had already
+    upgraded it: it gains the marker, and a label the user has since chosen --
+    even a legacy word -- is left alone."""
+    state = {"version": 2, "identities": {"uuid-a": _identity(E1, "work")},
+             "label_map": {E1: "work"}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)
+        with open(accounts.state_path(), encoding="utf-8") as handle:
+            disk = json.load(handle)
+        emit({"label": disk["label_map"].get(ARGS["own"]),
+              "marked": bool(disk.get("legacy_labels_retired"))})
+    """, state=state, args={"own": E1})
+    return got == {"label": "work", "marked": True}, got
+
+
+def check_sessions_footer_counts_after_filters() -> Tuple[bool, Any]:
+    """With a filter, the footer's "of M" and its --limit 0 hint count what the
+    filter left, not every transcript on disk."""
+    code, out = cli(["sessions", "--days", "1", "--limit", "1"], sessions=5, recent=2)
+    lines = [line.strip() for line in out.splitlines()]
+    footer = [line for line in lines if "session" in line and "$" in line]
+    hint = [line for line in lines if "--limit 0" in line]
+    ok = (code == 0 and any(line.startswith("1 of 2 sessions") for line in footer)
+          and any(line.endswith("lists all 2") for line in hint))
+    return ok, {"exit": code, "footer": footer, "hint": hint}
 
 
 def check_legacy_config_pin_maps_to_primary() -> Tuple[bool, Any]:
@@ -542,6 +689,12 @@ CHECKS: List[Callable[[], Tuple[bool, Any]]] = [
     check_upgrade_survives_a_non_integer_version,
     check_dashboard_page_announces_the_cap,
     check_failed_scan_clears_the_cap_caption,
+    check_first_login_is_primary_after_an_early_assignment,
+    check_failed_upgrade_is_retried,
+    check_old_build_rows_are_resynced,
+    check_login_without_a_map_entry_is_not_split,
+    check_v2_file_without_the_mark_is_not_renamed_again,
+    check_sessions_footer_counts_after_filters,
     check_legacy_config_pin_maps_to_primary,
     check_scan_reports_what_the_cap_dropped,
     check_sessions_footer_names_its_scope,

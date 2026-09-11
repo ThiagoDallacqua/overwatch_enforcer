@@ -323,12 +323,11 @@ def allocate_label(address: str) -> str:
         # Pinned labels are taken too: a config that says "this address is
         # primary" must not see a second address allocated 'primary' merely
         # because the learned map happened to be empty.
+        # Taken: the map's labels and pinned ones -- NOT names on hand
+        # assignments. A session assigned 'primary' before any login is seen
+        # means "my first account" and joins it; the upgrade mints no
+        # free-floating names for a new login to collide with.
         taken = {str(v).strip() for v in mapping.values()} | _pinned_labels()
-        # Every label anything still holds is taken too, not only the map's: a
-        # hand assignment or a stamp can carry a name no login has, and handing
-        # that name to a new login would move those sessions onto it.
-        taken |= {str(row.get("label") or "").strip() for row in _each_label_holder(state)}
-        taken.discard("")
         if not mapping and LABEL_PRIMARY not in taken:
             name = LABEL_PRIMARY
         else:
@@ -439,43 +438,52 @@ def _each_label_holder(state: Dict[str, Any]):
 
 
 def _upgrade(state: Dict[str, Any]) -> bool:
-    """Bring a state file written by an older build up to date, in place. Once.
+    """Bring a state file an older build wrote back in line, in place.
 
-    On a file that has never been through it:
-      * label_map entries for addresses that never logged in here are dropped.
-        Only the scrubber ever put them there -- it allocated a label for every
-        address it met -- no session can resolve to one, and each is a third
-        party's address sitting in local state.
-      * every LOGIN still carrying 'personal' or 'work' gets a current name of
-        its own: its config pin if it has one, else the first free of 'primary'
-        (for 'personal'), 'secondary', 'secondary-N'. Per login, not per label
-        string: a legacy install could hold several logins under one 'work', and
-        a string rename would keep them merged. Pins and every label still held
-        count as taken, so no two logins end up sharing a name.
-      * a stamped row follows its login through the account uuid it carries.
-      * a legacy label on a hand assignment follows only when it maps to exactly
-        one login. Otherwise it stays as the user typed it: rewriting what
-        somebody typed into a guessed name is worse than an old word on screen,
-        and `oe account rename` settles it.
-      * the 'inferred' bucket goes with the heuristic that filled it.
+    Two parts, because they have different safety properties.
 
-    At most once per file (_UPGRADE_MARK). A file already at version 2 without
-    the mark was written by a build whose _mutate ran this before stamping 2, so
-    it only gains the mark. Works on a copy that is swapped in only on success:
-    a failure part-way leaves the state exactly as it was, unmarked, and the
-    next pass retries. Never raises.
+    EVERY time the file comes back below version 2 -- written by an older build,
+    upgraded before or not; a supervisor started before an update keeps writing
+    with its old code:
+      * the 'inferred' bucket goes, with the heuristic that filled it;
+      * label_map entries for addresses that never logged in are pruned. Only a
+        scrubber ever put them there, no session can resolve to one, and each is
+        a third party's address sitting in local state;
+      * a login or stamp row carrying 'personal'/'work' takes its login's current
+        name (its pin, else its map entry).
+    None of that touches a label_map name or a hand assignment, so it cannot undo
+    a rename the user made -- which is what makes it safe to repeat.
+
+    ONCE per file (_UPGRADE_MARK):
+      * every login whose map entry or identity still carries 'personal'/'work'
+        gets a current name of its own: its config pin if it has one, else the
+        first free of 'primary' (for 'personal'), 'secondary', 'secondary-N'.
+        Per login, not per label string -- a legacy install could hold several
+        logins under one 'work'. Pins and every label still held count as taken,
+        and each renamed login gets a map entry, so its next lookup finds this
+        name instead of allocating a second one;
+      * a legacy label on a hand assignment, or on a stamp whose login is
+        unknown, moves only when it maps to exactly one login. Otherwise it stays
+        as typed: rewriting what somebody typed into a guessed name is worse than
+        an old word on screen, and `oe account rename` settles it.
+
+    A file at version 2 without the mark was written by a build whose _mutate ran
+    this before stamping 2, so it only gains the mark; _mutate stamps 2 only on a
+    marked state, so a failed upgrade is never read as a finished one. Works on a
+    copy that is swapped in only on success. Never raises.
     """
-    if state.get(_UPGRADE_MARK):
-        return False
     try:
         version: Optional[int] = int(state.get("version") or 1)
     except (TypeError, ValueError):
-        version = None                  # hand-edited or corrupt: upgrade it
+        version = None                  # hand-edited or corrupt: treat as old
     if version is not None and version >= 2:
+        if state.get(_UPGRADE_MARK):
+            return False
         state[_UPGRADE_MARK] = True
         return True
     try:
         work = copy.deepcopy(state)
+        once = not work.get(_UPGRADE_MARK)
         work.pop("inferred", None)
         mapping = work.get("label_map")
         if not isinstance(mapping, dict):
@@ -499,63 +507,97 @@ def _upgrade(state: Dict[str, Any]) -> bool:
                     first_seen.setdefault(email, float(row.get("first_seen") or 0))
                 except (TypeError, ValueError):
                     pass
-        # Which legacy name each login carries now.
-        carries: Dict[str, str] = {}
-        for address, label in mapping.items():
-            if str(label).strip() in _LEGACY_LABELS:
-                carries[str(address).strip().lower()] = str(label).strip()
+        pins = _config_labels()
+        legacy_email = _legacy_personal_email()
+        by_legacy: Dict[str, set] = {}
+        if once:
+            # Which logins to rename: those whose CURRENT name -- pin, else map
+            # entry, else (only when neither exists) their identity row -- is a
+            # legacy word. A pinned login keeps its pin, and a login whose map
+            # already says 'secondary' is not renamed because a stale identity
+            # row still says 'work'; the every-pass part below fixes that row.
+            map_lower = {str(a).strip().lower(): str(l).strip() for a, l in mapping.items()}
+            identity_label: Dict[str, str] = {}
+            for row in identities.values():
+                if isinstance(row, dict):
+                    email = str(row.get("email") or "").strip().lower()
+                    if email:
+                        identity_label.setdefault(email, str(row.get("label") or "").strip())
+            carries: Dict[str, str] = {}
+            for address in set(map_lower) | set(identity_label):
+                if pins.get(address) or (legacy_email and address == legacy_email):
+                    continue
+                name = map_lower.get(address) or identity_label.get(address)
+                if name in _LEGACY_LABELS:
+                    carries[address] = name
+            # Taken: every label held by something OTHER than a login being
+            # renamed. A login's own rows must not block its own name.
+            taken = {label for address, label in map_lower.items() if address not in carries}
+            for row in identities.values():
+                if isinstance(row, dict) and \
+                        str(row.get("email") or "").strip().lower() not in carries:
+                    taken.add(str(row.get("label") or "").strip())
+            for row in (work.get("stamped") or {}).values():
+                if isinstance(row, dict) and email_of_uuid.get(str(row.get("uuid"))) not in carries:
+                    taken.add(str(row.get("label") or "").strip())
+            for row in (work.get("assigned") or {}).values():
+                if isinstance(row, dict):
+                    taken.add(str(row.get("label") or "").strip())
+            taken = {name for name in taken if name and name not in _LEGACY_LABELS}
+            taken |= _pinned_labels()
+            renamed: Dict[str, str] = {}
+            for address in sorted(carries, key=lambda a: (carries[a] != "personal",
+                                                          first_seen.get(a, 0.0), a)):
+                name = None
+                if not name:
+                    wanted = ([LABEL_PRIMARY] if carries[address] == "personal" else []) \
+                        + [LABEL_SECONDARY]
+                    name = next((n for n in wanted if n not in taken), None)
+                    counter = 2
+                    while name is None:
+                        candidate = f"{LABEL_SECONDARY}-{counter}"
+                        counter += 1
+                        if candidate not in taken:
+                            name = candidate
+                renamed[address] = name
+                taken.add(name)
+                by_legacy.setdefault(carries[address], set()).add(name)
+            present = {str(a).strip().lower(): a for a in mapping}
+            for address, name in renamed.items():
+                if address in present:
+                    mapping[present[address]] = name
+                elif not (pins.get(address) or address == legacy_email):
+                    mapping[address] = name
+            assigned = work.get("assigned")
+            if isinstance(assigned, dict):
+                for row in assigned.values():
+                    if isinstance(row, dict):
+                        label = str(row.get("label") or "").strip()
+                        if label in _LEGACY_LABELS and len(by_legacy.get(label, ())) == 1:
+                            row["label"] = next(iter(by_legacy[label]))
+        # Every pass: a login or stamp row carrying a legacy word takes its
+        # login's current name -- the same precedence _stored_label() reads.
+        current = {str(a).strip().lower(): str(l).strip() for a, l in mapping.items()}
+        if legacy_email:
+            current[legacy_email] = LABEL_PRIMARY
+        current.update(pins)
         for row in identities.values():
             if isinstance(row, dict) and str(row.get("label") or "").strip() in _LEGACY_LABELS:
                 email = str(row.get("email") or "").strip().lower()
-                if email:
-                    carries.setdefault(email, str(row["label"]).strip())
-        taken = {str(v).strip() for v in mapping.values()}
-        taken |= {str(row.get("label") or "").strip() for row in _each_label_holder(work)}
-        taken = {name for name in taken if name and name not in _LEGACY_LABELS}
-        taken |= _pinned_labels()
-        pins = _config_labels()
-        legacy_email = _legacy_personal_email()
-        new_name: Dict[str, str] = {}
-        for address in sorted(carries, key=lambda a: (carries[a] != "personal",
-                                                      first_seen.get(a, 0.0), a)):
-            name = pins.get(address) or (LABEL_PRIMARY if address == legacy_email else None)
-            if not name:
-                wanted = ([LABEL_PRIMARY] if carries[address] == "personal" else []) \
-                    + [LABEL_SECONDARY]
-                name = next((n for n in wanted if n not in taken), None)
-                counter = 2
-                while name is None:
-                    candidate = f"{LABEL_SECONDARY}-{counter}"
-                    counter += 1
-                    if candidate not in taken:
-                        name = candidate
-            new_name[address] = name
-            taken.add(name)
-        for address in list(mapping):
-            if str(address).strip().lower() in new_name:
-                mapping[address] = new_name[str(address).strip().lower()]
-        for row in identities.values():
-            if isinstance(row, dict):
-                email = str(row.get("email") or "").strip().lower()
-                if email in new_name:
-                    row["label"] = new_name[email]
-        by_legacy: Dict[str, set] = {}
-        for address, old in carries.items():
-            by_legacy.setdefault(old, set()).add(new_name[address])
-        for bucket in ("stamped", "assigned"):
-            rows = work.get(bucket)
-            if not isinstance(rows, dict):
-                continue
-            for row in rows.values():
+                if email in current:
+                    row["label"] = current[email]
+        stamped = work.get("stamped")
+        if isinstance(stamped, dict):
+            for row in stamped.values():
                 if not isinstance(row, dict):
                     continue
                 label = str(row.get("label") or "").strip()
                 if label not in _LEGACY_LABELS:
                     continue
-                email = email_of_uuid.get(str(row.get("uuid"))) if bucket == "stamped" else None
-                if email and email in new_name:
-                    row["label"] = new_name[email]
-                elif len(by_legacy.get(label, ())) == 1:
+                email = email_of_uuid.get(str(row.get("uuid")))
+                if email and email in current:
+                    row["label"] = current[email]
+                elif once and len(by_legacy.get(label, ())) == 1:
                     row["label"] = next(iter(by_legacy[label]))
         work[_UPGRADE_MARK] = True
     except Exception:
@@ -681,7 +723,11 @@ def _mutate(apply) -> Dict[str, Any]:
             changed = False
         changed = changed or upgraded
         if changed:
-            data["version"] = STATE_VERSION
+            # Version 2 only once the upgrade is marked done. Stamped on a state
+            # whose upgrade just failed, it would read as "already upgraded" on
+            # the next pass, which would then never retry.
+            if data.get(_UPGRADE_MARK):
+                data["version"] = STATE_VERSION
             try:
                 paths.atomic_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
                 _CACHE["mtime"] = -1.0  # force the next load_state() off disk
