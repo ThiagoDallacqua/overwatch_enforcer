@@ -473,13 +473,18 @@ def check_failed_upgrade_is_retried() -> Tuple[bool, Any]:
             state.setdefault("stamped", {})["s-new"] = {"uuid": "uuid-a", "label": "primary", "ts": 0}
             return True
         accounts._mutate(stamp)                   # an ordinary write while the upgrade fails
+        with open(accounts.state_path(), encoding="utf-8") as handle:
+            first = json.load(handle)
         accounts._mutate(lambda _state: False)    # the next pass
         with open(accounts.state_path(), encoding="utf-8") as handle:
             disk = json.load(handle)
-        emit({"label_map": disk.get("label_map"), "inferred": "inferred" in disk,
+        emit({"failure_fired": calls["n"] >= 1,
+              "first_write": [first.get("version"), bool(first.get("legacy_labels_retired"))],
+              "label_map": disk.get("label_map"), "inferred": "inferred" in disk,
               "marked": bool(disk.get("legacy_labels_retired")), "version": disk.get("version")})
     """, state=state)
-    want = {"label_map": {E1: "primary"}, "inferred": False, "marked": True, "version": 2}
+    want = {"failure_fired": True, "first_write": [1, False], "label_map": {E1: "primary"},
+            "inferred": False, "marked": True, "version": 2}
     return got == want, got
 
 
@@ -574,6 +579,106 @@ def check_sessions_footer_counts_after_filters() -> Tuple[bool, Any]:
     ok = (code == 0 and any(line.startswith("1 of 2 sessions") for line in footer)
           and any(line.endswith("lists all 2") for line in hint))
     return ok, {"exit": code, "footer": footer, "hint": hint}
+
+
+def check_legacy_personal_email_install_upgrades_fully() -> Tuple[bool, Any]:
+    """On a v1.0.x install configured with `accounts.personal_email`, nothing is
+    left saying 'personal' or 'work': hand assignments and owner-less stamps
+    follow the one login their word belonged to, pinned login included.
+
+    Found in review: pinned logins were skipped by the rename, so their legacy
+    word never learned its answer -- 'personal' assignments stayed a bucket of
+    their own, invisible to `--account primary`.
+    """
+    state = {"version": 1,
+             "identities": {"uuid-a": _identity(E1, "personal"),
+                            "uuid-b": _identity(E2, "work")},
+             "label_map": {E1: "personal"},
+             "stamped": {"s5": {"uuid": None, "label": "personal", "ts": 0}},
+             "assigned": {"s4": {"label": "personal", "ts": 0},
+                          "s6": {"label": "work", "ts": 0}}}
+    got = scenario("""
+        from oe import accounts, paths
+        base = paths.load_config()
+        paths.load_config = lambda: dict(base, accounts={"personal_email": ARGS["own"]})
+        accounts._mutate(lambda _state: False)
+        state = accounts.load_state()
+        emit({"s4": accounts.resolve("s4", None)["label"],
+              "s5": state["stamped"]["s5"]["label"],
+              "s6": accounts.resolve("s6", None)["label"],
+              "second": accounts.label_for_email(ARGS["second"]),
+              "legacy_offered": sorted(set(accounts.known_labels()) & {"personal", "work"})})
+    """, state=state, args={"own": E1, "second": E2})
+    want = {"s4": "primary", "s5": "primary", "s6": "secondary", "second": "secondary",
+            "legacy_offered": []}
+    return got == want, got
+
+
+def check_login_an_old_build_adds_later_gets_one_name() -> Tuple[bool, Any]:
+    """A login that an older build first meets AFTER the upgrade -- identity and
+    stamps written under 'work', no map entry -- gets one current name, the same
+    for its old sessions and its new ones.
+
+    Found in review: only the one-time pass renamed logins, so such a login kept
+    'work' on its old sessions and was allocated a different name for new ones.
+    """
+    state = {"version": 2, "legacy_labels_retired": True,
+             "identities": {"uuid-a": _identity(E1, "primary")},
+             "label_map": {E1: "primary"}}
+    got = scenario("""
+        from oe import accounts
+        path = accounts.state_path()
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        raw["version"] = 1                                     # an older build, still running
+        raw["identities"]["uuid-c"] = {"email": ARGS["third"], "label": "work",
+                                       "first_seen": 0, "last_seen": 0}
+        raw.setdefault("stamped", {})["s9"] = {"uuid": "uuid-c", "label": "work", "ts": 0}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle)
+        accounts._mutate(lambda _state: False)
+        emit({"old_session": accounts.resolve("s9", None)["label"],
+              "login_now": accounts.label_for_email(ARGS["third"])})
+    """, state=state, args={"third": E3})
+    return got == {"old_session": "secondary", "login_now": "secondary"}, got
+
+
+def check_mixed_case_map_key_is_one_login() -> Tuple[bool, Any]:
+    """A label_map key with capitals (a hand edit) is the same login as its
+    lowercase address: renamed once, looked up once, never given a second name."""
+    state = {"version": 1,
+             "identities": {"uuid-a": _identity(E1, "primary"),
+                            "uuid-b": _identity(E2, "work")},
+             "label_map": {E1: "primary", E2.upper(): "work"},
+             "stamped": {"s2": {"uuid": "uuid-b", "label": "work", "ts": 0}}}
+    got = scenario("""
+        from oe import accounts
+        accounts._mutate(lambda _state: False)
+        state = accounts.load_state()
+        emit({"login": accounts.label_for_email(ARGS["second"]),
+              "stamp": state["stamped"]["s2"]["label"],
+              "keys": sorted(state["label_map"])})
+    """, state=state, args={"second": E2})
+    return got == {"login": "secondary", "stamp": "secondary", "keys": sorted([E1, E2])}, got
+
+
+def check_upgrade_swaps_in_only_on_success() -> Tuple[bool, Any]:
+    """An upgrade that fails part-way leaves the state exactly as it was --
+    nothing pruned, nothing renamed -- rather than half-applied."""
+    state = {"version": 1, "identities": {"uuid-a": _identity(E1, "personal")},
+             "label_map": {E1: "personal", E4: "secondary"},
+             "inferred": {"s3": {"hint": "org_quota", "scanned_bytes": 5}}}
+    got = scenario("""
+        from oe import accounts
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("fails after the prune step")
+        accounts._pinned_labels = broken
+        state = accounts.load_state()
+        emit({"label_map": state["label_map"], "inferred": "inferred" in state,
+              "marked": bool(state.get("legacy_labels_retired"))})
+    """, state=state)
+    want = {"label_map": {E1: "personal", E4: "secondary"}, "inferred": True, "marked": False}
+    return got == want, got
 
 
 def check_legacy_config_pin_maps_to_primary() -> Tuple[bool, Any]:
@@ -695,6 +800,10 @@ CHECKS: List[Callable[[], Tuple[bool, Any]]] = [
     check_login_without_a_map_entry_is_not_split,
     check_v2_file_without_the_mark_is_not_renamed_again,
     check_sessions_footer_counts_after_filters,
+    check_legacy_personal_email_install_upgrades_fully,
+    check_login_an_old_build_adds_later_gets_one_name,
+    check_mixed_case_map_key_is_one_login,
+    check_upgrade_swaps_in_only_on_success,
     check_legacy_config_pin_maps_to_primary,
     check_scan_reports_what_the_cap_dropped,
     check_sessions_footer_names_its_scope,
