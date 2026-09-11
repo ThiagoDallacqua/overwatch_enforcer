@@ -365,8 +365,10 @@ it re-points the `oe` symlink. On most pulls it will say there was
 nothing to do, and that is the answer you wanted.
 
 `oe supervise --ensure` is there because the supervisor is a long-lived process: it keeps
-executing the code it started with until it is restarted, so a pull does not reach it.
-Nothing else needs restarting — the hooks are spawned fresh by Claude Code every time, and
+executing the code it started with, so a pull alone does not reach it. `--ensure` compares the
+code on disk with the code the running supervisor started from and, when they differ, replaces
+it. The one exception is a supervisor running inside `oe watch --inline`, which stops with that
+view and is left alone. Nothing else needs restarting — the hooks are spawned fresh by Claude Code every time, and
 the CLI is a script.
 
 **Your data and your settings are not in the repository**, which is what makes `git pull`

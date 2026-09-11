@@ -9,7 +9,7 @@
     oe report [sid|--last]  build report.html now, print the path
     oe open  [sid|--last]   open that report in a browser
     oe path  [sid|--last]   just print where it is (stable from the session id)
-    oe supervise --ensure   start the background writer if it is not up
+    oe supervise --ensure   start the background writer, or restart it after an update
     oe sessions             table of sessions, most recent first (40 unless --limit)
     oe dashboard            rebuild the cross-session index.html
     oe backfill             build reports for past transcripts
@@ -1135,9 +1135,12 @@ def cmd_open(args) -> int:
 def cmd_supervise(args) -> int:
     """Start / inspect / stop the one background supervisor.
 
-    `--ensure` is the shell-rc entry point: when a supervisor is already up it
-    costs one flock probe and returns, which is the common case on every
-    terminal after the first.
+    `--ensure` is the shell-rc entry point: when a current supervisor is already
+    up it costs one flock probe and one hash of the package source, which is the
+    common case on every terminal after the first. When the code on disk has
+    changed since that supervisor started -- a `git pull`, an upgrade -- it is
+    replaced, which is what lets the update reach it. One running inside
+    `oe watch --inline` is never touched: stopping it would close that view.
     """
     from oe import watcher as watcher_mod
     if args.status:
@@ -1148,14 +1151,16 @@ def cmd_supervise(args) -> int:
         if not args.quiet:
             print("stopped" if stopped else "still running")
         return 0 if stopped else 1
-    existing = watcher_mod.supervisor_running()
-    if existing:
-        if not args.quiet:
-            print(f"supervisor already running (pid {existing})")
-        return 0
     state = watcher_mod.ensure_supervisor()
     if not args.quiet:
-        if state.get("running"):
+        if state.get("restarted") and state.get("running"):
+            print(f"supervisor restarted (pid {state.get('pid')}; pid "
+                  f"{state.get('previous_pid')} was stale: {state.get('reason')})")
+        elif state.get("mode") == "existing":
+            note = (f" -- out of date ({state['out_of_date']}) but it would not stop; "
+                    "try `oe supervise --stop`" if state.get("out_of_date") else "")
+            print(f"supervisor already running (pid {state.get('pid')}){note}")
+        elif state.get("running"):
             print(f"supervisor started (pid {state.get('pid')})")
         else:
             print(c("supervisor did not start", AMBER), file=sys.stderr)
@@ -4649,8 +4654,9 @@ def build_parser() -> argparse.ArgumentParser:
     supervise = sub.add_parser(
         "supervise", help="start / inspect / stop the background supervisor")
     supervise.add_argument("--ensure", action="store_true",
-                           help="start one only if none is running (the default, and "
-                                "what the shell-rc line calls)")
+                           help="start one if none is running, or replace one running "
+                                "out-of-date code (the default, and what the shell-rc "
+                                "line calls)")
     supervise.add_argument("--status", action="store_true", help="print its status as JSON")
     supervise.add_argument("--stop", action="store_true", help="stop the running supervisor")
     supervise.add_argument("--quiet", "-q", action="store_true", help="say nothing")

@@ -488,7 +488,10 @@ is writing it, `stale` with its age when nothing has updated it recently.
 ### `oe supervise --ensure | --status | --stop`
 
 Starts, inspects or stops the background writer. `--ensure` decides the race with a flock, not
-with the pidfile, so a stale `state/supervisor.pid` cannot produce two supervisors.
+with the pidfile, so a stale `state/supervisor.pid` cannot produce two supervisors. When one is
+already running from code that has since changed — after a `git pull` or an upgrade —
+`--ensure` replaces it; one running inside `oe watch --inline` is never touched, because
+stopping it would close that view.
 `--status` prints JSON: whether it is running, its pid and the paths of its pidfile, lockfile,
 status file and log, plus a snapshot of its own timings and what it is tracking.
 
